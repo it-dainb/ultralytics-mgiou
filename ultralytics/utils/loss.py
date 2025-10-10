@@ -16,8 +16,6 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
-from mgiou import MGIoU2D
-
 class VarifocalLoss(nn.Module):
     """
     Varifocal loss by Zhang et al.
@@ -107,6 +105,129 @@ class DFLoss(nn.Module):
             + F.cross_entropy(pred_dist, tr.view(-1), reduction="none").view(tl.shape) * wr
         ).mean(-1, keepdim=True)
 
+class MGIoU2DLoss(nn.Module):
+    """MGIoU loss for either rotated rectangles (x,y,w,h,θ) or explicit 4-corner boxes."""
+    def __init__(
+        self,
+        representation: str = "rect",        # "rect" or "corner"
+        reduction: str = "mean",
+        loss_weight: float = 1.0,
+        fast_mode: bool = False,
+    ):
+        super().__init__()
+        if representation not in {"rect", "corner"}:
+            raise ValueError("representation must be 'rect' or 'corner'")
+        self.representation = representation
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.fast_mode = fast_mode
+
+        # only needed if converting from (x,y,w,h,θ)
+        self.register_buffer(
+            "_unit_square",
+            torch.tensor([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=torch.float32),
+        )
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        weight: torch.Tensor | None = None,
+        reduction_override: str | None = None,
+        avg_factor: float | None = None,
+    ) -> torch.Tensor:
+        red = reduction_override or self.reduction
+
+        # --- convert or validate inputs ---
+        if self.representation == "rect":
+            # (B,5) → corners
+            if pred.shape != target.shape or pred.shape[-1] != 5:
+                raise ValueError("Expected (B,5) boxes for 'rect' mode")
+            B = pred.size(0)
+
+            # detect degenerate GTs → fallback to L1 as before
+            all_zero = (target.abs().sum(dim=1) == 0)
+            losses = pred.new_zeros(B)
+            if all_zero.any():
+                l1 = F.l1_loss(pred[all_zero], target[all_zero], reduction="none")
+                losses[all_zero] = l1.sum(dim=1)
+
+            mask = ~all_zero
+            if mask.any():
+                # convert to corners
+                c1 = self._rect_to_corners(pred[mask])
+                c2 = self._rect_to_corners(target[mask])
+                losses[mask] = self._mgiou_boxes(c1, c2)
+
+        else:  # "corner" mode
+            # expect (B,4,2)
+            if pred.ndim != 3 or pred.shape[-2:] != (4, 2):
+                raise ValueError("Expected (B,4,2) corners for 'corner' mode")
+            if pred.shape != target.shape:
+                raise ValueError("pred and target must match shape")
+            B = pred.size(0)
+            # compute MGIoU on all
+            losses = self._mgiou_boxes(pred, target)
+
+        # --- weighting & reduction (common) ---
+        if weight is not None:
+            weight = weight.view(-1) if weight.dim() > 1 else weight
+            losses = losses * weight
+            if avg_factor is None:
+                avg_factor = weight.sum().clamp_min(1.0)
+        avg_factor = float(avg_factor or B)
+        loss = self._reduce(losses, red) / avg_factor
+        return (loss * self.loss_weight).to(pred.dtype)
+
+    def _mgiou_boxes(self, c1: torch.Tensor, c2: torch.Tensor) -> torch.Tensor:
+        # c1, c2: (N,4,2)
+        dtype = c1.dtype
+
+        axes = torch.cat((self._rect_axes(c1), self._rect_axes(c2)), dim=1).to(dtype)  # [N,4,2]
+        proj1 = c1 @ axes.transpose(1, 2)  # [N,4,4]
+        proj2 = c2 @ axes.transpose(1, 2)
+
+        mn1, mx1 = proj1.min(dim=1).values, proj1.max(dim=1).values
+        mn2, mx2 = proj2.min(dim=1).values, proj2.max(dim=1).values
+
+        if self.fast_mode:
+            num = torch.minimum(mx1, mx2) - torch.maximum(mn1, mn2)
+            den = torch.maximum(mx1, mx2) - torch.minimum(mn1, mn2) + 0 # ESPilon to avoid zero division
+            giou1d = num / den
+        else:
+            inter = (torch.minimum(mx1, mx2) - torch.maximum(mn1, mn2)).clamp(min=0.0)
+            union = (mx1 - mn1) + (mx2 - mn2) - inter
+            hull  = (torch.maximum(mx1, mx2) - torch.minimum(mn1, mn2))
+            giou1d = inter / union - (hull - union) / hull
+
+        return ((1.0 - giou1d.mean(dim=-1)) * 0.5).to(dtype)
+
+    def _rect_to_corners(self, boxes: torch.Tensor) -> torch.Tensor:
+        trans, wh, angle = boxes[:, :2], boxes[:, 2:4], boxes[:, 4]
+        base = self._unit_square.to(boxes.dtype).unsqueeze(0) * (wh * 0.5).unsqueeze(1)  # [B,4,2]
+        cos_a, sin_a = angle.cos(), angle.sin()
+        rot = torch.stack(
+            (torch.stack((cos_a, -sin_a), -1), torch.stack((sin_a, cos_a), -1)),
+            dim=1,
+        )  # [B,2,2]
+        return torch.bmm(base, rot) + trans.unsqueeze(1)  # [B,4,2]
+
+    @staticmethod
+    def _rect_axes(corners: torch.Tensor) -> torch.Tensor:
+        e1 = corners[:, 1] - corners[:, 0]
+        e2 = corners[:, 3] - corners[:, 0]
+        normals = torch.stack((-e1[..., 1:], e1[..., :1], -e2[..., 1:], e2[..., :1]), dim=1)
+        return normals.view(-1, 2, 2)
+
+    @staticmethod
+    def _reduce(loss: torch.Tensor, reduction: str) -> torch.Tensor:
+        if reduction == "mean":
+            return loss.mean()
+        if reduction == "sum":
+            return loss.sum()
+        if reduction == "none":
+            return loss
+        raise ValueError(f"Unsupported reduction: {reduction!r}")
 
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
@@ -148,7 +269,7 @@ class RotatedBboxLoss(BboxLoss):
     def __init__(self, reg_max: int, use_mgiou: bool = False):
         """Initialize the RotatedBboxLoss module with regularization maximum and DFL settings."""
         super().__init__(reg_max)
-        self.use_mgiou = use_mgiou
+        self.mgiou_loss = MGIoU2DLoss(representation="rect", reduction="sum") if use_mgiou else None
 
     def forward(
         self,
@@ -163,15 +284,13 @@ class RotatedBboxLoss(BboxLoss):
         """Compute IoU and DFL losses for rotated bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
 
-        if self.use_mgiou:
-            loss_iou = MGIoU2D(reduction='sum').to(
-                pred_bboxes.device,
-            )(
-                pred_bboxes[fg_mask].to(torch.float32),  
-                target_bboxes[fg_mask].to(torch.float32), 
-                weight=weight.to(torch.float32), 
+        if self.mgiou_loss:
+            loss_iou = self.mgiou_loss(
+                pred_bboxes[fg_mask],
+                target_bboxes[fg_mask],
+                weight=weight,
                 avg_factor=target_scores_sum
-            ).to(pred_bboxes.dtype)
+            )
         else:
             iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
             loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
