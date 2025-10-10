@@ -181,11 +181,9 @@ class MGIoU2DLoss(nn.Module):
 
     def _mgiou_boxes(self, c1: torch.Tensor, c2: torch.Tensor) -> torch.Tensor:
         # c1, c2: (N,4,2)
-        dtype = c1.dtype
-
-        axes = torch.cat((self._rect_axes(c1), self._rect_axes(c2)), dim=1).to(dtype)  # [N,4,2]
-        proj1 = c1 @ axes.transpose(1, 2)  # [N,4,4]
-        proj2 = c2 @ axes.transpose(1, 2)
+        axes = torch.cat((self._rect_axes(c1), self._rect_axes(c2)), dim=1)  # [N,4,2]
+        proj1 = c1.to(axes.dtype) @ axes.transpose(1, 2)  # [N,4,4]
+        proj2 = c2.to(axes.dtype) @ axes.transpose(1, 2)
 
         mn1, mx1 = proj1.min(dim=1).values, proj1.max(dim=1).values
         mn2, mx2 = proj2.min(dim=1).values, proj2.max(dim=1).values
@@ -200,7 +198,7 @@ class MGIoU2DLoss(nn.Module):
             hull  = (torch.maximum(mx1, mx2) - torch.minimum(mn1, mn2))
             giou1d = inter / union - (hull - union) / hull
 
-        return ((1.0 - giou1d.mean(dim=-1)) * 0.5).to(dtype)
+        return ((1.0 - giou1d.mean(dim=-1)) * 0.5)
 
     def _rect_to_corners(self, boxes: torch.Tensor) -> torch.Tensor:
         trans, wh, angle = boxes[:, :2], boxes[:, 2:4], boxes[:, 4]
@@ -287,8 +285,8 @@ class RotatedBboxLoss(BboxLoss):
         if self.mgiou_loss:
             loss_iou = self.mgiou_loss(
                 pred_bboxes[fg_mask],
-                target_bboxes[fg_mask],
-                weight=weight,
+                target_bboxes[fg_mask].to(pred_bboxes.dtype),
+                weight=weight.to(pred_bboxes.dtype),
                 avg_factor=target_scores_sum
             )
         else:
