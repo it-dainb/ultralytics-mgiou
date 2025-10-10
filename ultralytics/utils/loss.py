@@ -164,10 +164,14 @@ class RotatedBboxLoss(BboxLoss):
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
 
         if self.use_mgiou:
-            loss_iou = MGIoU2D().to(
+            loss_iou = MGIoU2D(reduction='sum').to(
                 pred_bboxes.device,
-                pred_bboxes.dtype,
-            )(pred_bboxes[fg_mask],  target_bboxes[fg_mask], weight=weight, avg_factor=target_scores_sum)
+            )(
+                pred_bboxes[fg_mask].to(torch.float32),  
+                target_bboxes[fg_mask].to(torch.float32), 
+                weight=weight.to(torch.float32), 
+                avg_factor=target_scores_sum
+            ).to(pred_bboxes.dtype)
         else:
             iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
             loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
