@@ -39,6 +39,7 @@ freeze: # (int | list, optional) freeze first N layers (int) or specific layer i
 multi_scale: False # (bool) multiscale training by varying image size
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
 use_mgiou: False # (bool) Whether to use mgiou during training obb model, it is recommended to set this parameter to True.
+only_mgiou: False # (bool) When True, uses only mgiou_loss for segmentation (skips seg_loss); requires use_mgiou=True
 
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)

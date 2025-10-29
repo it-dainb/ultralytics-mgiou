@@ -773,6 +773,37 @@ class v8SegmentationLoss(v8DetectionLoss):
             
             # Convert back to torch tensor (shape: [N, 2] where N≥3)
             corners = torch.from_numpy(approx.reshape(-1, 2)).float().to(mask.device)
+
+            # Remove duplicate points while preserving original occurrence order
+            if corners.shape[0] > 1:
+                try:
+                    uniq_idx = np.unique(corners.cpu().numpy(), axis=0, return_index=True)[1]
+                    uniq_idx.sort()
+                    corners = corners[uniq_idx]
+                except Exception:
+                    # Fallback: keep corners as-is if unique fails for any reason
+                    pass
+
+            # Need at least 3 unique corners
+            if corners.shape[0] < 3:
+                return None
+
+            # Deterministic ordering: sort points by angle around centroid
+            centroid = corners.mean(dim=0)
+            angles = torch.atan2(corners[:, 1] - centroid[1], corners[:, 0] - centroid[0])
+            order = torch.argsort(angles)
+            corners = corners[order]
+
+            # Rotate so that the corner with smallest (y + x) (top-left-ish) is first
+            start_idx = torch.argmin(corners[:, 0] + corners[:, 1])
+            corners = torch.roll(corners, -int(start_idx), dims=0)
+
+            # Clamp to mask bounds and round to integer pixel coords for stability
+            h, w = mask_np.shape
+            corners[:, 0] = corners[:, 0].clamp(0, w - 1)
+            corners[:, 1] = corners[:, 1].clamp(0, h - 1)
+            corners = corners.round()
+
             return corners
             
         except (RuntimeError, ValueError, cv2.error):
