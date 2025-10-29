@@ -1087,18 +1087,17 @@ class v8PolygonLoss(v8DetectionLoss):
                 fg_mask, target_gt_idx, polygons, batch_idx, stride_tensor, target_bboxes, pred_poly
             )
             
-            # When use_mgiou=True: poly_main_loss is MGIoU, otherwise L2
             loss[1] = poly_main_loss
-            # loss[4] is only for box MGIoU (when use_mgiou=False)
-            # When use_mgiou=True, MGIoU is already in loss[1], so loss[4] stays 0
-            if not self.use_mgiou:
-                loss[4] = box_mgiou
+            loss[4] = poly_main_loss if self.use_mgiou else box_mgiou
 
         loss[0] *= self.hyp.box
         loss[1] *= self.hyp.polygon
         loss[2] *= self.hyp.cls
         loss[3] *= self.hyp.dfl
-        loss[4] *= self.hyp.box  # box MGIoU weight (only used when use_mgiou=False)
+        if self.use_mgiou:
+            loss[4] *= self.hyp.polygon
+        else:
+            loss[4] *= self.hyp.box
 
         return loss * batch_size, loss.detach()
 
