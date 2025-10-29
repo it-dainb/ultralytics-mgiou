@@ -84,9 +84,10 @@ class PolygonValidator(DetectionValidator):
             )
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Preprocess batch by converting keypoints data to float and moving it to the device."""
+        """Preprocess batch by converting polygon data to float and moving it to the device."""
         batch = super().preprocess(batch)
-        batch["keypoints"] = batch["keypoints"].float()
+        if "polygons" in batch:
+            batch["polygons"] = batch["polygons"].float()
         return batch
 
     def get_desc(self) -> str:
