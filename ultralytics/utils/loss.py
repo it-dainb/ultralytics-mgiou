@@ -1076,23 +1076,31 @@ class v8PolygonLoss(v8DetectionLoss):
 
         if fg_mask.sum():
             target_bboxes /= stride_tensor
-            loss[0], loss[3], loss[4] = self.bbox_loss(
+            loss[0], loss[3], box_mgiou = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
             polygons = batch["polygons"].to(self.device).float().clone()
             polygons[..., 0] *= imgsz[1]
             polygons[..., 1] *= imgsz[0]
 
-            loss[1] = self.calculate_polygon_loss(
+            poly_l2_loss, poly_mgiou_loss = self.calculate_polygon_loss(
                 fg_mask, target_gt_idx, polygons, batch_idx, stride_tensor, target_bboxes, pred_poly
             )
+            
+            # Use polygon MGIoU if available, otherwise fall back to box MGIoU
+            if self.use_mgiou:
+                loss[1] = poly_mgiou_loss
+                loss[4] = poly_mgiou_loss  # Store MGIoU component separately for logging
+            else:
+                loss[1] = poly_l2_loss
+                loss[4] = box_mgiou
 
         loss[0] *= self.hyp.box
         loss[1] *= self.hyp.polygon
         loss[2] *= self.hyp.cls
         loss[3] *= self.hyp.dfl
         if self.use_mgiou:
-            loss[4] *= self.hyp.box
+            loss[4] *= self.hyp.polygon  # Scale by polygon weight since it's polygon MGIoU
 
         return loss * batch_size, loss.detach()
 
@@ -1113,9 +1121,10 @@ class v8PolygonLoss(v8DetectionLoss):
         stride_tensor: torch.Tensor,
         target_bboxes: torch.Tensor,
         pred_poly: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_idx = batch_idx.flatten()
         polys_loss = torch.zeros(1, device=self.device)
+        mgiou_loss_accum = torch.zeros(1, device=self.device)
 
         for i in range(pred_poly.shape[0]):
             fg_mask_i = masks[i]
@@ -1128,10 +1137,11 @@ class v8PolygonLoss(v8DetectionLoss):
                 area = xyxy2xywh(target_bboxes[i][fg_mask_i])[:, 2:].prod(1, keepdim=True)
                 pred_poly_i = pred_poly[i][fg_mask_i]
                 poly_mask = torch.full_like(gt_poly_scaled[..., 0], True)
-                poly_loss, _ = self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
+                poly_loss, mgiou_loss = self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
                 polys_loss += poly_loss
+                mgiou_loss_accum += mgiou_loss
 
-        return polys_loss
+        return polys_loss, mgiou_loss_accum
 
 class v8ClassificationLoss:
     """Criterion class for computing training losses for classification."""
