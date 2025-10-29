@@ -1128,7 +1128,8 @@ class v8PolygonLoss(v8DetectionLoss):
                 area = xyxy2xywh(target_bboxes[i][fg_mask_i])[:, 2:].prod(1, keepdim=True)
                 pred_poly_i = pred_poly[i][fg_mask_i]
                 poly_mask = torch.full_like(gt_poly_scaled[..., 0], True)
-                polys_loss += self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
+                poly_loss, _ = self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
+                polys_loss += poly_loss
 
         return polys_loss
 
