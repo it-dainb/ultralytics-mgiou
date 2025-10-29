@@ -111,7 +111,7 @@ class PolygonTrainer(yolo.detect.DetectionTrainer):
             If `np` is not in the dataset YAML, it will be read from the model configuration.
             This allows the model YAML to define the number of polygon points.
         """
-        from ultralytics.cfg import yaml_model_load
+        from ultralytics.nn.tasks import yaml_model_load
         
         data = super().get_dataset()
         if "np" not in data:
