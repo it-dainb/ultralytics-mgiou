@@ -594,7 +594,19 @@ class v8SegmentationLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
-        loss = torch.zeros(5 if self.use_mgiou else 4, device=self.device)  # box, seg, cls, dfl, [mgiou]
+        # When only_mgiou=True, we skip seg_loss (index 1), so loss tensor layout changes:
+        # Normal: [box, seg, cls, dfl, mgiou] (5 elements)
+        # only_mgiou: [box, cls, dfl, mgiou] (4 elements, seg_loss omitted)
+        if self.only_mgiou:
+            loss = torch.zeros(4, device=self.device)  # box, cls, dfl, mgiou
+            cls_idx, dfl_idx, mgiou_idx = 1, 2, 3
+        elif self.use_mgiou:
+            loss = torch.zeros(5, device=self.device)  # box, seg, cls, dfl, mgiou
+            cls_idx, dfl_idx, mgiou_idx = 2, 3, 4
+        else:
+            loss = torch.zeros(4, device=self.device)  # box, seg, cls, dfl
+            cls_idx, dfl_idx = 2, 3
+        
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -642,11 +654,11 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[cls_idx] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
         if fg_mask.sum():
             # Bbox loss
-            loss[0], loss[3] = self.bbox_loss(
+            loss[0], loss[dfl_idx] = self.bbox_loss(
                 pred_distri,
                 pred_bboxes,
                 anchor_points,
@@ -660,27 +672,36 @@ class v8SegmentationLoss(v8DetectionLoss):
             if tuple(masks.shape[-2:]) != (mask_h, mask_w):  # downsample
                 masks = F.interpolate(masks[None], (mask_h, mask_w), mode="nearest")[0]
 
-            if self.use_mgiou:
-                loss[1], loss[4] = self.calculate_segmentation_loss(
+            if self.only_mgiou:
+                # Only compute mgiou_loss, skip seg_loss
+                _, loss[mgiou_idx] = self.calculate_segmentation_loss(
+                    fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
+                )
+            elif self.use_mgiou:
+                # Compute both seg_loss and mgiou_loss
+                loss[1], loss[mgiou_idx] = self.calculate_segmentation_loss(
                     fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
                 )
             else:
+                # Only compute seg_loss
                 loss[1] = self.calculate_segmentation_loss(
                     fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
                 )
 
         # WARNING: lines below prevent Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
         else:
-            loss[1] += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
+            if not self.only_mgiou:
+                loss[1] += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
 
         loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.box  # seg gain
-        loss[2] *= self.hyp.cls  # cls gain
-        loss[3] *= self.hyp.dfl  # dfl gain
+        if not self.only_mgiou:
+            loss[1] *= self.hyp.box  # seg gain
+        loss[cls_idx] *= self.hyp.cls  # cls gain
+        loss[dfl_idx] *= self.hyp.dfl  # dfl gain
         if self.use_mgiou:
-            loss[4] *= self.hyp.box  # mgiou gain (same as seg)
+            loss[mgiou_idx] *= self.hyp.box  # mgiou gain (same as seg)
 
-        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, [mgiou])
+        return loss * batch_size, loss.detach()  # loss(box, seg/cls, cls/dfl, dfl/mgiou, [mgiou])
 
     @staticmethod
     def single_mask_loss(
