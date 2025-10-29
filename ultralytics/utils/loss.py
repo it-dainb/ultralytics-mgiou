@@ -1121,7 +1121,7 @@ class v8PolygonLoss(v8DetectionLoss):
             fg_mask_i = masks[i]
             if fg_mask_i.sum():
                 target_gt_idx_i = target_gt_idx[i][fg_mask_i]
-                gt_matching_bs = batch_idx[target_gt_idx_i]
+                gt_matching_bs = batch_idx[target_gt_idx_i].long()
                 gt_poly_scaled = gt_poly[gt_matching_bs]
                 gt_poly_scaled[..., 0] /= stride_tensor[i]
                 gt_poly_scaled[..., 1] /= stride_tensor[i]
