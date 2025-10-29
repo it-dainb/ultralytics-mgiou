@@ -69,12 +69,13 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
         if self.only_mgiou:
-            # When only_mgiou=True, skip seg_loss and only show mgiou_loss
-            self.loss_names = "box_loss", "cls_loss", "dfl_loss", "mgiou_loss"
+            # When only_mgiou=True, skip seg_loss and show separate MGIoU components
+            self.loss_names = "box_loss", "cls_loss", "dfl_loss", "mgiou_loss", "chamfer_loss", "corner_penalty"
         else:
             self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss"
             if self.use_mgiou:
-                self.loss_names += ("mgiou_loss",)
+                # Add separate MGIoU component losses for detailed logging
+                self.loss_names += ("mgiou_loss", "chamfer_loss", "corner_penalty")
         return yolo.segment.SegmentationValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
