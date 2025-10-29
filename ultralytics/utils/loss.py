@@ -321,8 +321,8 @@ class MGIoUPoly(nn.Module):
             mask = torch.cat((mask1, mask2), dim=1)  # [B_valid, N+M] - True = valid, False = degenerate
 
             # Project vertices onto all axes (vectorized)
-            proj1 = torch.bmm(pred_sorted, axes.transpose(1, 2))
-            proj2 = torch.bmm(target_sorted, axes.transpose(1, 2))
+            proj1 = torch.bmm(pred_sorted.to(axes.dtype), axes.transpose(1, 2))
+            proj2 = torch.bmm(target_sorted.to(axes.dtype), axes.transpose(1, 2))
             min1, _ = proj1.min(dim=1)
             max1, _ = proj1.max(dim=1)
             min2, _ = proj2.min(dim=1)
