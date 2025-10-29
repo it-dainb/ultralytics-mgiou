@@ -953,9 +953,12 @@ class v8SegmentationLoss(v8DetectionLoss):
         """
         _, _, mask_h, mask_w = proto.shape
         loss = 0
-        mgiou_component = 0
-        chamfer_component = 0
-        corner_penalty_component = 0
+        
+        # Initialize components as tensors on the correct device
+        device = proto.device
+        mgiou_component = torch.tensor(0.0, device=device)
+        chamfer_component = torch.tensor(0.0, device=device)
+        corner_penalty_component = torch.tensor(0.0, device=device)
 
         # Normalize to 0-1
         target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
@@ -999,9 +1002,11 @@ class v8SegmentationLoss(v8DetectionLoss):
         
         # Return separate losses if MGIoU is enabled
         if self.use_mgiou:
-            mgiou_normalized = mgiou_component / fg_mask.sum() if mgiou_component > 0 else torch.tensor(0.0, device=total_loss.device)
-            chamfer_normalized = chamfer_component / fg_mask.sum() if chamfer_component > 0 else torch.tensor(0.0, device=total_loss.device)
-            corner_normalized = corner_penalty_component / fg_mask.sum() if corner_penalty_component > 0 else torch.tensor(0.0, device=total_loss.device)
+            # Normalize by number of foreground masks, ensure proper device handling
+            fg_sum = fg_mask.sum()
+            mgiou_normalized = mgiou_component / fg_sum if mgiou_component.item() > 0 else torch.tensor(0.0, device=total_loss.device)
+            chamfer_normalized = chamfer_component / fg_sum if chamfer_component.item() > 0 else torch.tensor(0.0, device=total_loss.device)
+            corner_normalized = corner_penalty_component / fg_sum if corner_penalty_component.item() > 0 else torch.tensor(0.0, device=total_loss.device)
             return total_loss, mgiou_normalized, chamfer_normalized, corner_normalized
         
         return total_loss
@@ -1067,8 +1072,9 @@ class v8SegmentationLoss(v8DetectionLoss):
         gt_batch = torch.stack(gt_polygons)      # (K, 32, 2)
         
         # Compute loss components (can be batched now that sizes match)
-        total_mgiou_loss = 0.0
-        total_chamfer_loss = 0.0
+        # Initialize as tensors on the correct device
+        total_mgiou_loss = torch.tensor(0.0, device=gt_masks.device)
+        total_chamfer_loss = torch.tensor(0.0, device=gt_masks.device)
         
         # Process each pair (future: could be fully batched if MGIoU supports it)
         for pred_poly, gt_poly in zip(pred_batch, gt_batch):
