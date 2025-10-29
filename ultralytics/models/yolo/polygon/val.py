@@ -10,67 +10,70 @@ import torch
 
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import LOGGER, ops
-from ultralytics.utils.metrics import OKS_SIGMA, PoseMetrics, kpt_iou
+from ultralytics.utils.metrics import OKS_SIGMA, PoseMetrics, kpt_iou, poly_iou
 
 
 class PolygonValidator(DetectionValidator):
     """
-    A class extending the DetectionValidator class for validation based on a pose model.
+    A class extending the DetectionValidator class for validation based on a polygon model.
 
-    This validator is specifically designed for pose estimation tasks, handling keypoints and implementing
-    specialized metrics for pose evaluation.
+    This validator is specifically designed for polygon detection tasks, handling polygon vertices and implementing
+    specialized metrics for polygon evaluation.
 
     Attributes:
-        sigma (np.ndarray): Sigma values for OKS calculation, either OKS_SIGMA or ones divided by number of keypoints.
-        np (list[int]): Shape of the keypoints, typically [17, 3] for COCO format.
-        args (dict): Arguments for the validator including task set to "pose".
-        metrics (PoseMetrics): Metrics object for pose evaluation.
+        sigma (np.ndarray): Sigma values for polygon IoU calculation (one value per vertex).
+        np (int): Number of polygon vertices.
+        args (dict): Arguments for the validator including task set to "polygon".
+        metrics (PoseMetrics): Metrics object for polygon evaluation (reuses pose metrics infrastructure).
 
     Methods:
-        preprocess: Preprocess batch by converting keypoints data to float and moving it to the device.
+        preprocess: Preprocess batch by converting polygon data to float and moving it to the device.
         get_desc: Return description of evaluation metrics in string format.
-        init_metrics: Initialize pose estimation metrics for YOLO model.
-        _prepare_batch: Prepare a batch for processing by converting keypoints to float and scaling to original
+        init_metrics: Initialize polygon detection metrics for YOLO model.
+        _prepare_batch: Prepare a batch for processing by converting polygons to float and scaling to original
             dimensions.
-        _prepare_pred: Prepare and scale keypoints in predictions for pose processing.
+        _prepare_pred: Prepare and scale polygon vertices in predictions for processing.
         _process_batch: Return correct prediction matrix by computing Intersection over Union (IoU) between
-            detections and ground truth.
-        plot_val_samples: Plot and save validation set samples with ground truth bounding boxes and keypoints.
-        plot_predictions: Plot and save model predictions with bounding boxes and keypoints.
-        save_one_txt: Save YOLO pose detections to a text file in normalized coordinates.
+            polygon detections and ground truth.
+        plot_val_samples: Plot and save validation set samples with ground truth bounding boxes and polygons.
+        plot_predictions: Plot and save model predictions with bounding boxes and polygons.
+        save_one_txt: Save YOLO polygon detections to a text file in normalized coordinates.
         pred_to_json: Convert YOLO predictions to COCO JSON format.
-        eval_json: Evaluate object detection model using COCO JSON format.
+        eval_json: Evaluate polygon detection model using COCO JSON format.
 
     Examples:
-        >>> from ultralytics.models.yolo.pose import PoseValidator
-        >>> args = dict(model="yolo11n-pose.pt", data="coco8-pose.yaml")
-        >>> validator = PoseValidator(args=args)
+        >>> from ultralytics.models.yolo.polygon import PolygonValidator
+        >>> args = dict(model="yolo11n-polygon.pt", data="coco8-polygon.yaml")
+        >>> validator = PolygonValidator(args=args)
         >>> validator()
+    
+    Notes:
+        Internally uses "keypoints" field name for compatibility with inherited pose validation infrastructure,
+        but the data represents polygon vertices (N, num_vertices, 2).
     """
 
     def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
         """
-        Initialize a PoseValidator object for pose estimation validation.
+        Initialize a PolygonValidator object for polygon detection validation.
 
-        This validator is specifically designed for pose estimation tasks, handling keypoints and implementing
-        specialized metrics for pose evaluation.
+        This validator is specifically designed for polygon detection tasks, handling polygon vertices and implementing
+        specialized metrics for polygon evaluation using MGIoU.
 
         Args:
             dataloader (torch.utils.data.DataLoader, optional): Dataloader to be used for validation.
             save_dir (Path | str, optional): Directory to save results.
-            args (dict, optional): Arguments for the validator including task set to "pose".
+            args (dict, optional): Arguments for the validator including task set to "polygon".
             _callbacks (list, optional): List of callback functions to be executed during validation.
 
         Examples:
-            >>> from ultralytics.models.yolo.pose import PoseValidator
-            >>> args = dict(model="yolo11n-pose.pt", data="coco8-pose.yaml")
-            >>> validator = PoseValidator(args=args)
+            >>> from ultralytics.models.yolo.polygon import PolygonValidator
+            >>> args = dict(model="yolo11n-polygon.pt", data="coco8-polygon.yaml")
+            >>> validator = PolygonValidator(args=args)
             >>> validator()
 
         Notes:
-            This class extends DetectionValidator with pose-specific functionality. It initializes with sigma values
-            for OKS calculation and sets up PoseMetrics for evaluation. A warning is displayed when using Apple MPS
-            due to a known bug with pose models.
+            This class extends DetectionValidator with polygon-specific functionality. It reuses PoseMetrics
+            infrastructure for evaluation. A warning is displayed when using Apple MPS due to a known bug.
         """
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.sigma = None
@@ -79,7 +82,7 @@ class PolygonValidator(DetectionValidator):
         self.metrics = PoseMetrics()
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
-                "Apple MPS known Pose bug. Recommend 'device=cpu' for Pose models. "
+                "Apple MPS known bug. Recommend 'device=cpu' for Polygon models. "
                 "See https://github.com/ultralytics/ultralytics/issues/4031."
             )
 
@@ -108,7 +111,7 @@ class PolygonValidator(DetectionValidator):
 
     def init_metrics(self, model: torch.nn.Module) -> None:
         """
-        Initialize evaluation metrics for YOLO pose validation.
+        Initialize evaluation metrics for YOLO polygon validation.
 
         Args:
             model (torch.nn.Module): Model to validate.
@@ -123,28 +126,27 @@ class PolygonValidator(DetectionValidator):
 
     def postprocess(self, preds: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Postprocess YOLO predictions to extract and reshape keypoints for pose estimation.
+        Postprocess YOLO predictions to extract and reshape polygon vertices.
 
-        This method extends the parent class postprocessing by extracting keypoints from the 'extra'
-        field of predictions and reshaping them according to the keypoint shape configuration.
-        The keypoints are reshaped from a flattened format to the proper dimensional structure
-        (typically [N, 17, 3] for COCO pose format).
+        This method extends the parent class postprocessing by extracting polygon vertices from the 'extra'
+        field of predictions and reshaping them according to the polygon vertex count configuration.
+        The vertices are reshaped from a flattened format to the proper dimensional structure
+        (typically [N, num_vertices, 2] for polygon format).
 
         Args:
-            preds (torch.Tensor): Raw prediction tensor from the YOLO pose model containing
-                bounding boxes, confidence scores, class predictions, and keypoint data.
+            preds (torch.Tensor): Raw prediction tensor from the YOLO polygon model containing
+                bounding boxes, confidence scores, class predictions, and polygon vertex data.
 
         Returns:
             (dict[torch.Tensor]): Dict of processed prediction dictionaries, each containing:
                 - 'bboxes': Bounding box coordinates
                 - 'conf': Confidence scores
                 - 'cls': Class predictions
-                - 'keypoints': Reshaped keypoint coordinates with shape (-1, *self.np)
+                - 'keypoints': Reshaped polygon vertices with shape (-1, self.np, 2)
 
         Note:
-            If no keypoints are present in a prediction (empty keypoints), that prediction
-            is skipped and continues to the next one. The keypoints are extracted from the
-            'extra' field which contains additional task-specific data beyond basic detection.
+            Internally stores vertices in 'keypoints' field for compatibility with PoseMetrics infrastructure.
+            The 'extra' field contains polygon vertex data beyond basic detection outputs.
         """
         preds = super().postprocess(preds)
         for pred in preds:
@@ -158,18 +160,19 @@ class PolygonValidator(DetectionValidator):
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
         """
-        Prepare a batch for processing by converting keypoints to float and scaling to original dimensions.
+        Prepare a batch for processing by converting polygon vertices to float and scaling to original dimensions.
 
         Args:
             si (int): Batch index.
-            batch (dict[str, Any]): Dictionary containing batch data with keys like 'keypoints', 'batch_idx', etc.
+            batch (dict[str, Any]): Dictionary containing batch data with keys like 'polygons', 'batch_idx', etc.
 
         Returns:
-            (dict[str, Any]): Prepared batch with keypoints scaled to original image dimensions.
+            (dict[str, Any]): Prepared batch with polygon vertices scaled to original image dimensions.
 
         Notes:
-            This method extends the parent class's _prepare_batch method by adding keypoint processing.
-            Keypoints are scaled from normalized coordinates to original image dimensions.
+            This method extends the parent class's _prepare_batch method by adding polygon processing.
+            Polygon vertices are scaled from normalized coordinates to original image dimensions.
+            Internally stored as 'keypoints' for compatibility with PoseMetrics infrastructure.
         """
         pbatch = super()._prepare_batch(si, batch)
         polygons = batch["polygons"][batch["batch_idx"] == si]
@@ -191,38 +194,37 @@ class PolygonValidator(DetectionValidator):
                 'bboxes' for bounding boxes, and 'keypoints' for keypoint annotations.
 
         Returns:
-            (dict[str, np.ndarray]): Dictionary containing the correct prediction matrix including 'tp_p' for pose
+            (dict[str, np.ndarray]): Dictionary containing the correct prediction matrix including 'tp_p' for polygon
                 true positives across 10 IoU levels.
 
         Notes:
-            `0.53` scale factor used in area computation is referenced from
-            https://github.com/jin-s13/xtcocoapi/blob/master/xtcocotools/cocoeval.py#L384.
+            Uses MGIoU-based poly_iou metric for polygon matching, which returns GIoU scores in range [-1, 1].
         """
         tp = super()._process_batch(preds, batch)
         gt_cls = batch["cls"]
         if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
             tp_p = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
         else:
-            # `0.53` is from https://github.com/jin-s13/xtcocoapi/blob/master/xtcocotools/cocoeval.py#L384
-            area = ops.xyxy2xywh(batch["bboxes"])[:, 2:].prod(1) * 0.53
-            iou = kpt_iou(batch["keypoints"], preds["keypoints"], sigma=self.sigma, area=area)
+            # Use polygon IoU instead of keypoint-based OKS
+            # poly_iou returns GIoU-based scores in range [-1, 1]
+            iou = poly_iou(batch["keypoints"], preds["keypoints"])
             tp_p = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
-        tp.update({"tp_p": tp_p})  # update tp with kpts IoU
+        tp.update({"tp_p": tp_p})  # update tp with polygon IoU
         return tp
 
     def save_one_txt(self, predn: dict[str, torch.Tensor], save_conf: bool, shape: tuple[int, int], file: Path) -> None:
         """
-        Save YOLO pose detections to a text file in normalized coordinates.
+        Save YOLO polygon detections to a text file in normalized coordinates.
 
         Args:
-            predn (dict[str, torch.Tensor]): Dictionary containing predictions with keys 'bboxes', 'conf', 'cls' and 'keypoints.
+            predn (dict[str, torch.Tensor]): Dictionary containing predictions with keys 'bboxes', 'conf', 'cls' and 'keypoints'.
             save_conf (bool): Whether to save confidence scores.
             shape (tuple[int, int]): Shape of the original image (height, width).
             file (Path): Output file path to save detections.
 
         Notes:
-            The output format is: class_id x_center y_center width height confidence keypoints where keypoints are
-            normalized (x, y, visibility) values for each point.
+            The output format is: class_id x_center y_center width height confidence vertices where vertices are
+            normalized (x, y) coordinate pairs for each polygon vertex.
         """
         from ultralytics.engine.results import Results
 

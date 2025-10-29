@@ -190,6 +190,47 @@ def kpt_iou(
     return ((-e).exp() * kpt_mask[:, None]).sum(-1) / (kpt_mask.sum(-1)[:, None] + eps)
 
 
+def poly_iou(poly1: torch.Tensor, poly2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Calculate polygon IoU using MGIoU-based metric.
+    
+    Args:
+        poly1 (torch.Tensor): Ground truth polygons of shape (N, num_vertices, 2).
+        poly2 (torch.Tensor): Predicted polygons of shape (M, num_vertices, 2).
+        eps (float, optional): Small value to avoid division by zero.
+    
+    Returns:
+        (torch.Tensor): IoU matrix of shape (N, M) with values in range [-1, 1].
+                       Higher values indicate better overlap.
+    
+    Notes:
+        This function uses MGIoU (Multi-Granularity IoU) for polygon matching.
+        The returned values are GIoU-based scores where:
+        - 1.0 = perfect match
+        - 0.0 = no overlap but in same vicinity  
+        - <0 = no overlap and far apart
+    """
+    from ultralytics.utils.loss import MGIoUPoly
+    
+    N, M = poly1.shape[0], poly2.shape[0]
+    
+    if N == 0 or M == 0:
+        return torch.zeros((N, M), device=poly1.device, dtype=poly1.dtype)
+    
+    # Expand for pairwise comparison: (N, M, num_vertices, 2)
+    poly1_expanded = poly1.unsqueeze(1).expand(N, M, -1, -1).reshape(N * M, -1, 2)
+    poly2_expanded = poly2.unsqueeze(0).expand(N, M, -1, -1).reshape(N * M, -1, 2)
+    
+    # Compute MGIoU loss: loss = (1 - giou) * 0.5
+    mgiou_loss = MGIoUPoly(reduction="none")
+    losses = mgiou_loss(poly2_expanded, poly1_expanded)
+    
+    # Convert loss to GIoU: giou = 1 - 2*loss
+    giou = 1 - 2 * losses.reshape(N, M)
+    
+    return giou.clamp(min=-1.0, max=1.0)
+
+
 def _get_covariance_matrix(boxes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate covariance matrix from oriented bounding boxes.
