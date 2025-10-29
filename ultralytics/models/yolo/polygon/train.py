@@ -102,15 +102,41 @@ class PolygonTrainer(yolo.detect.DetectionTrainer):
 
     def get_dataset(self) -> dict[str, Any]:
         """
-        Retrieve the dataset and ensure it contains the required `np` key.
+        Retrieve the dataset and add `np` from model config if not in dataset.
 
         Returns:
             (dict): A dictionary containing the training/validation/test dataset and category names.
 
-        Raises:
-            KeyError: If the `np` key is not present in the dataset.
+        Notes:
+            If `np` is not in the dataset YAML, it will be read from the model configuration.
+            This allows the model YAML to define the number of polygon points.
         """
+        from ultralytics.cfg import yaml_model_load
+        
         data = super().get_dataset()
         if "np" not in data:
-            raise KeyError(f"No `np` in the {self.args.data}. See https://docs.ultralytics.com/datasets/pose/")
+            if not isinstance(self.args.model, dict):
+                model_cfg = yaml_model_load(self.args.model)
+            else:
+                model_cfg = self.args.model
+            
+            if "np" in model_cfg:
+                data["np"] = model_cfg["np"]
+                LOGGER.info(f"Using np={model_cfg['np']} from model configuration")
+            else:
+                raise KeyError(
+                    f"No `np` found in either {self.args.data} or {self.args.model}. "
+                    f"Please specify the number of polygon points in your model or dataset YAML."
+                )
         return data
+%cd /content/
+
+!YOLO_VERBOSE=True yolo polygon \
+train data=./datasets/final/cc_obb.yaml \
+model=./polygon.yaml \
+use_mgiou=True single_cls=True dfl=0 \
+optimizer='AdamW' lr0=0.005 dropout=0.01 cos_lr=True\
+epochs=100 patience=0 batch=0.9 \
+imgsz={IMG_SIZE} rect=True \
+plots=True compile=False pretrained=False augment=True auto_augment=autoaugment \
+project=/content/drive/MyDrive/DFS/DIGI_TEXX/1998_CC_03/models name=phase1 exist_ok=True
