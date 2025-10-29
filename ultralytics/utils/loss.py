@@ -345,7 +345,7 @@ class MGIoUPoly(nn.Module):
             num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
             giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
             
-            losses[valid_mask] = ((1.0 - giou_val) * 0.5)
+            losses[valid_mask] = ((1.0 - giou_val) * 0.5).to(losses.dtype)
         
         # --- weighting & reduction (matching MGIoURect behavior) ---
         if weight is not None:
