@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -745,9 +746,7 @@ class v8SegmentationLoss(v8DetectionLoss):
     def interpolate_polygon_padding(corners: torch.Tensor, target_size: int) -> torch.Tensor:
         """
         Pad polygon to target size by interpolating between existing corners.
-        
-        OPTIMIZED: Since mask_to_polygon_corners now returns fixed-size polygons,
-        this function is simplified and only handles edge cases.
+        This creates smooth transitions instead of degenerate repeated corners.
         
         Args:
             corners (torch.Tensor): Input corners of shape (N, 2) where N >= 3.
@@ -757,17 +756,46 @@ class v8SegmentationLoss(v8DetectionLoss):
             (torch.Tensor): Padded corners of shape (target_size, 2).
         """
         n = corners.shape[0]
-        
-        # If already at target size or larger, return as-is or truncate
         if n >= target_size:
-            return corners[:target_size]
+            return corners
         
-        # If we need to pad, use simple repetition (faster than complex interpolation)
-        # Since the new implementation uses fixed sizes, this is rarely called
-        repeat_factor = (target_size + n - 1) // n
-        padded = corners.repeat(repeat_factor, 1)[:target_size]
+        # Calculate how many points to insert
+        num_to_insert = target_size - n
         
-        return padded
+        # Calculate edge lengths to distribute insertions proportionally
+        edges = torch.roll(corners, -1, dims=0) - corners
+        edge_lengths = torch.norm(edges, dim=1)
+        
+        # Distribute insertions proportionally to edge lengths
+        # Longer edges get more inserted points
+        insertions_per_edge = (edge_lengths / edge_lengths.sum() * num_to_insert).round().int()
+        
+        # Adjust to ensure exact count
+        diff = num_to_insert - insertions_per_edge.sum().item()
+        if diff > 0:
+            # Add remaining to longest edges
+            longest_edges = torch.argsort(edge_lengths, descending=True)[:diff]
+            insertions_per_edge[longest_edges] += 1
+        elif diff < 0:
+            # Remove from edges that have insertions
+            for _ in range(-diff):
+                idx = (insertions_per_edge > 0).nonzero(as_tuple=True)[0]
+                if len(idx) > 0:
+                    insertions_per_edge[idx[0]] -= 1
+        
+        # Build new corner list with interpolated points
+        new_corners = []
+        for i in range(n):
+            new_corners.append(corners[i])
+            num_insert = insertions_per_edge[i].item()
+            if num_insert > 0:
+                next_corner = corners[(i + 1) % n]
+                for j in range(1, num_insert + 1):
+                    alpha = j / (num_insert + 1)
+                    interpolated = corners[i] * (1 - alpha) + next_corner * alpha
+                    new_corners.append(interpolated)
+        
+        return torch.stack(new_corners)
 
     @staticmethod
     def chamfer_distance(pred_corners: torch.Tensor, gt_corners: torch.Tensor) -> torch.Tensor:
@@ -795,7 +823,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         return (pred_to_gt + gt_to_pred) / 2
 
     @staticmethod
-    def smooth_l1_corner_penalty(pred_count: int, gt_count: int, tolerance: int = 2, beta: float = 2.0) -> torch.Tensor:
+    def smooth_l1_corner_penalty(pred_count: int, gt_count: int, tolerance: int = 2, beta: float = 2.0) -> float:
         """
         Soft penalty for corner count mismatch with tolerance.
         No penalty if difference is within tolerance, smooth penalty beyond.
@@ -807,11 +835,11 @@ class v8SegmentationLoss(v8DetectionLoss):
             beta (float): Smooth L1 beta parameter (controls smoothness).
             
         Returns:
-            (torch.Tensor): Corner count penalty (scalar).
+            (float): Corner count penalty (scalar value, will be converted to tensor by caller).
         """
         diff = abs(pred_count - gt_count)
         if diff <= tolerance:
-            return torch.tensor(0.0)
+            return 0.0
         
         # Apply smooth L1 only to the excess beyond tolerance
         excess = diff - tolerance
@@ -820,100 +848,98 @@ class v8SegmentationLoss(v8DetectionLoss):
         else:
             penalty = excess - 0.5 * beta
         
-        return torch.tensor(penalty)
+        return float(penalty)
 
     @staticmethod
-    def mask_to_polygon_corners(mask: torch.Tensor, num_points: int = 32, threshold: float = 0.4) -> torch.Tensor | None:
+    def mask_to_polygon_corners(mask: torch.Tensor, epsilon_factor: float = 0.02, threshold: float = 0.4) -> torch.Tensor | None:
         """
-        Convert a binary mask to polygon corners using GPU-friendly boundary sampling.
+        Convert a binary mask to polygon corners using OpenCV contour approximation.
         
-        This version eliminates CPU-GPU synchronization by using pure PyTorch operations
-        instead of OpenCV, resulting in 10-50x speedup.
+        Enhanced version with:
+        - Lower threshold (0.4) for softer masks
+        - Coordinate normalization to [0, 1]
+        - Improved stability
         
-        Key improvements:
-        - No CPU-GPU transfers (stays entirely on GPU)
-        - Fixed number of output points (simplifies downstream processing)
-        - Uses morphological operations for boundary detection
-        - Uniform boundary sampling for polygon approximation
+        Note: MGIoU2DPlus supports any N≥3 corners, so we use a simple one-shot approximation
+        instead of binary search. This is faster and the exact corner count doesn't matter.
 
         Args:
             mask (torch.Tensor): Binary mask of shape (H, W).
-            num_points (int): Fixed number of boundary points to sample (default: 32).
+            epsilon_factor (float): Approximation accuracy factor (0.01-0.05 typical). 
+                                   Lower = more corners, Higher = fewer corners.
             threshold (float): Threshold for binarization (0.4 default, softer than 0.5).
 
         Returns:
-            (torch.Tensor | None): Normalized polygon corners of shape (num_points, 2) 
+            (torch.Tensor | None): Normalized polygon corners of shape (N, 2) where N≥3 
                                    with coordinates in [0, 1], or None if extraction fails.
         """
         try:
-            h, w = mask.shape
+            # Convert to numpy with lower threshold for softer masks
+            mask_np = (mask.detach().cpu().numpy() > threshold).astype('uint8')
+            h, w = mask_np.shape
             
-            # Binarize mask on GPU
-            binary_mask = (mask > threshold).float()
-            
-            # Check if mask has any positive pixels
-            if binary_mask.sum() < 3:
+            # Find contours
+            contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
                 return None
             
-            # Find boundary using morphological operations (GPU-based)
-            # Boundary = Dilate - Erode
-            kernel_size = 3
-            padding = kernel_size // 2
+            # Get largest contour by area
+            contour = max(contours, key=cv2.contourArea)
             
-            # Add batch and channel dimensions for conv operations
-            mask_4d = binary_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-            
-            # Dilate: max pooling
-            dilated = F.max_pool2d(mask_4d, kernel_size=kernel_size, stride=1, padding=padding)
-            
-            # Erode: -max_pool(-x) = min_pool(x)
-            eroded = -F.max_pool2d(-mask_4d, kernel_size=kernel_size, stride=1, padding=padding)
-            
-            # Boundary pixels
-            boundary = (dilated - eroded).squeeze()  # (H, W)
-            
-            # Get boundary coordinates (y, x format from nonzero)
-            boundary_coords = torch.nonzero(boundary > 0.5, as_tuple=False)  # (N, 2)
-            
-            if boundary_coords.shape[0] < 3:
+            # Minimum 3 corners required for MGIoU2DPlus
+            if len(contour) < 3:
                 return None
             
-            # Sample uniformly around boundary
-            num_boundary = boundary_coords.shape[0]
+            # Simple one-shot polygon approximation
+            arc_len = cv2.arcLength(contour, True)
+            epsilon = epsilon_factor * arc_len
+            approx = cv2.approxPolyDP(contour, epsilon, True)
             
-            if num_boundary > num_points:
-                # Uniform sampling: select evenly spaced points
-                indices = torch.linspace(0, num_boundary - 1, num_points, device=mask.device).long()
-                sampled_coords = boundary_coords[indices].float()
-            else:
-                # If fewer boundary points than desired, use all and pad by repeating
-                sampled_coords = boundary_coords.float()
-                if num_boundary < num_points:
-                    # Repeat points to reach target size
-                    repeat_factor = (num_points + num_boundary - 1) // num_boundary
-                    sampled_coords = sampled_coords.repeat(repeat_factor, 1)[:num_points]
+            # If too few corners, try with convex hull
+            if len(approx) < 3:
+                approx = cv2.convexHull(contour)
+                if len(approx) < 3:
+                    return None
             
-            # Convert from (y, x) to (x, y) format for consistency
-            corners = torch.stack([sampled_coords[:, 1], sampled_coords[:, 0]], dim=1)  # (num_points, 2)
-            
-            # Normalize to [0, 1] range
-            corners[:, 0] = corners[:, 0] / max(w - 1, 1)
-            corners[:, 1] = corners[:, 1] / max(h - 1, 1)
-            
-            # Sort points by angle around centroid for consistent ordering
+            # Convert back to torch tensor (shape: [N, 2] where N≥3)
+            corners = torch.from_numpy(approx.reshape(-1, 2)).float().to(mask.device)
+
+            # Remove duplicate points while preserving original occurrence order
+            if corners.shape[0] > 1:
+                try:
+                    uniq_idx = np.unique(corners.cpu().numpy(), axis=0, return_index=True)[1]
+                    uniq_idx.sort()
+                    corners = corners[uniq_idx]
+                except Exception:
+                    # Fallback: keep corners as-is if unique fails for any reason
+                    pass
+
+            # Need at least 3 unique corners
+            if corners.shape[0] < 3:
+                return None
+
+            # Clamp to mask bounds and round to integer pixel coords for stability
+            corners[:, 0] = corners[:, 0].clamp(0, w - 1)
+            corners[:, 1] = corners[:, 1].clamp(0, h - 1)
+            corners = corners.round()
+
+            # Deterministic ordering: sort points by angle around centroid
             centroid = corners.mean(dim=0)
             angles = torch.atan2(corners[:, 1] - centroid[1], corners[:, 0] - centroid[0])
             order = torch.argsort(angles)
             corners = corners[order]
-            
-            # Rotate so that point with smallest (x + y) is first (top-left-ish)
+
+            # Rotate so that the corner with smallest (y + x) (top-left-ish) is first
             start_idx = torch.argmin(corners[:, 0] + corners[:, 1])
-            corners = torch.roll(corners, -int(start_idx.item()), dims=0)
-            
+            corners = torch.roll(corners, -int(start_idx), dims=0)
+
+            # Normalize coordinates to [0, 1] for scale-invariance
+            corners[:, 0] = corners[:, 0] / (w - 1)
+            corners[:, 1] = corners[:, 1] / (h - 1)
+
             return corners
             
-        except (RuntimeError, ValueError) as e:
-            # Fallback to None on any error
+        except (RuntimeError, ValueError, cv2.error):
             return None
 
     def calculate_segmentation_loss(
@@ -1021,12 +1047,10 @@ class v8SegmentationLoss(v8DetectionLoss):
         """
         Compute enhanced hybrid MGIoU loss for mask polygons.
         
-        OPTIMIZED: Uses GPU-only operations with fixed-size polygons for better performance.
-        
         Uses combination of:
         1. MGIoU for IoU-based shape matching
         2. Chamfer distance for point-to-point matching  
-        3. Soft corner count penalty (deprecated with fixed-size approach)
+        3. Soft corner count penalty
         
         This approach maintains flexible corner counts while providing stable gradients.
 
@@ -1044,60 +1068,66 @@ class v8SegmentationLoss(v8DetectionLoss):
         if num_instances == 0:
             return zero_tensor, zero_tensor, zero_tensor
 
-        # Generate predicted masks (vectorized)
+        # Generate predicted masks
         pred_masks = torch.einsum("in,nhw->ihw", pred_coeffs, proto)  # (N, H, W)
         pred_masks = pred_masks.sigmoid()  # Apply sigmoid to get probabilities
 
-        # Convert masks to normalized polygon corners (fixed size for efficiency)
+        # Convert masks to normalized polygon corners
         pred_polygons = []
         gt_polygons = []
+        pred_counts = []
+        gt_counts = []
         
-        # Process all masks (GPU-only operations now!)
         for pred_mask, gt_mask in zip(pred_masks, gt_masks):
-            # Convert masks to normalized polygons with fixed size (32 points)
-            # This is now GPU-only, no CPU synchronization!
-            pred_poly = self.mask_to_polygon_corners(pred_mask, num_points=32)
-            gt_poly = self.mask_to_polygon_corners(gt_mask, num_points=32)
+            # Convert masks to normalized polygons (coordinates in [0, 1])
+            pred_poly = self.mask_to_polygon_corners(pred_mask)
+            gt_poly = self.mask_to_polygon_corners(gt_mask)
             
             if pred_poly is not None and gt_poly is not None:
                 pred_polygons.append(pred_poly)
                 gt_polygons.append(gt_poly)
+                pred_counts.append(pred_poly.shape[0])
+                gt_counts.append(gt_poly.shape[0])
 
         # If no valid polygons, return zero losses
         if len(pred_polygons) == 0:
             return zero_tensor, zero_tensor, zero_tensor
 
-        # Stack polygons (all are same size now: [N, 32, 2])
-        pred_batch = torch.stack(pred_polygons)  # (K, 32, 2)
-        gt_batch = torch.stack(gt_polygons)      # (K, 32, 2)
-        
-        # Compute loss components (can be batched now that sizes match)
+        # Compute three loss components
         # Initialize as tensors on the correct device
         total_mgiou_loss = torch.tensor(0.0, device=gt_masks.device)
         total_chamfer_loss = torch.tensor(0.0, device=gt_masks.device)
+        total_corner_penalty = torch.tensor(0.0, device=gt_masks.device)
         
-        # Process each pair (future: could be fully batched if MGIoU supports it)
-        for pred_poly, gt_poly in zip(pred_batch, gt_batch):
-            # 1. Chamfer distance (stable point-to-point matching)
+        for pred_poly, gt_poly, pred_n, gt_n in zip(pred_polygons, gt_polygons, pred_counts, gt_counts):
+            # 1. Chamfer distance (most stable, direct point matching)
             chamfer = self.chamfer_distance(pred_poly, gt_poly)
             total_chamfer_loss += chamfer
             
             # 2. MGIoU loss (IoU-based shape matching)
-            # Add batch dimension for MGIoU
-            pred_single = pred_poly.unsqueeze(0)  # (1, 32, 2)
-            gt_single = gt_poly.unsqueeze(0)      # (1, 32, 2)
+            # Pad to same size using interpolation (not repetition!)
+            max_corners = max(pred_n, gt_n)
+            pred_padded = self.interpolate_polygon_padding(pred_poly, max_corners)
+            gt_padded = self.interpolate_polygon_padding(gt_poly, max_corners)
+            
+            # Stack for batch processing
+            pred_batch = pred_padded.unsqueeze(0)  # (1, max_corners, 2)
+            gt_batch = gt_padded.unsqueeze(0)      # (1, max_corners, 2)
             
             # Compute MGIoU (returns loss, already 1 - IoU)
-            mgiou = self.mgiou_loss(pred_single, gt_single)
+            mgiou = self.mgiou_loss(pred_batch, gt_batch)
             total_mgiou_loss += mgiou
+            
+            # 3. Soft corner count penalty (tolerance of ±2 corners)
+            corner_penalty = self.smooth_l1_corner_penalty(pred_n, gt_n, tolerance=2, beta=2.0)
+            # Convert float to tensor on correct device
+            total_corner_penalty += corner_penalty
 
-        # Average over all valid instances
+        # Average over all instances
         num_valid = len(pred_polygons)
         avg_mgiou = total_mgiou_loss / num_valid
         avg_chamfer = total_chamfer_loss / num_valid
-        
-        # Corner penalty is zero now since we use fixed-size polygons
-        avg_corner_penalty = zero_tensor
+        avg_corner_penalty = total_corner_penalty / num_valid
         
         # Return separate components (weights applied in __call__)
         return avg_mgiou, avg_chamfer, avg_corner_penalty
