@@ -867,27 +867,36 @@ class v8SegmentationLoss(v8DetectionLoss):
             gt_poly = self.mask_to_polygon_corners(gt_mask)
             
             if pred_poly is not None and gt_poly is not None:
-                # Pad to same size for batching (MGIoU2DPlus requires matching N across batch)
-                # Note: Padding by repeating last corner creates degenerate edges (zero-length),
-                # but these produce zero normals which don't meaningfully affect the loss.
-                max_corners = max(pred_poly.shape[0], gt_poly.shape[0])
-                
-                if pred_poly.shape[0] < max_corners:
-                    # Pad by repeating last corner
-                    pad = pred_poly[-1:].repeat(max_corners - pred_poly.shape[0], 1)
-                    pred_poly = torch.cat([pred_poly, pad], dim=0)
-                
-                if gt_poly.shape[0] < max_corners:
-                    pad = gt_poly[-1:].repeat(max_corners - gt_poly.shape[0], 1)
-                    gt_poly = torch.cat([gt_poly, pad], dim=0)
-                
                 pred_polygons.append(pred_poly)
                 gt_polygons.append(gt_poly)
 
         # If we have valid polygons, compute MGIoU loss
         if len(pred_polygons) > 0 and len(gt_polygons) > 0:
-            pred_polygons = torch.stack(pred_polygons)  # (M, max_N, 2)
-            gt_polygons = torch.stack(gt_polygons)      # (M, max_N, 2)
+            # Find global max corners across ALL polygons in the batch
+            max_corners = max(
+                max(p.shape[0] for p in pred_polygons),
+                max(p.shape[0] for p in gt_polygons)
+            )
+            
+            # Pad all polygons to the same size
+            # Note: Padding by repeating last corner creates degenerate edges (zero-length),
+            # but these produce zero normals which don't meaningfully affect the loss.
+            padded_pred = []
+            padded_gt = []
+            
+            for pred_poly, gt_poly in zip(pred_polygons, gt_polygons):
+                if pred_poly.shape[0] < max_corners:
+                    pad = pred_poly[-1:].repeat(max_corners - pred_poly.shape[0], 1)
+                    pred_poly = torch.cat([pred_poly, pad], dim=0)
+                padded_pred.append(pred_poly)
+                
+                if gt_poly.shape[0] < max_corners:
+                    pad = gt_poly[-1:].repeat(max_corners - gt_poly.shape[0], 1)
+                    gt_poly = torch.cat([gt_poly, pad], dim=0)
+                padded_gt.append(gt_poly)
+            
+            pred_polygons = torch.stack(padded_pred)  # (M, max_corners, 2)
+            gt_polygons = torch.stack(padded_gt)      # (M, max_corners, 2)
             
             # Compute MGIoU loss
             loss = self.mgiou_loss(pred_polygons, gt_polygons)
