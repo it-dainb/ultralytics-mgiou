@@ -289,11 +289,10 @@ class YOLODataset(BaseDataset):
                         padded = np.zeros((np_points, 2), dtype=np.float32)
                         padded[:len(seg)] = seg
                         polygons.append(padded)
-                label["polygons"] = np.stack(polygons, axis=0)
+                # Store polygons in segments so they are preserved through augmentations
+                segments = np.stack(polygons, axis=0)
             else:
-                label["polygons"] = np.zeros((0, self.data.get("np", 4), 2), dtype=np.float32)
-            # Still keep segments for bbox calculation
-            segments = np.zeros((len(segments), 1, 2), dtype=np.float32) if len(segments) > 0 else np.zeros((0, 1, 2), dtype=np.float32)
+                segments = np.zeros((0, self.data.get("np", 4), 2), dtype=np.float32)
         else:
             # NOTE: do NOT resample oriented boxes
             segment_resamples = 100 if self.use_obb else 1000
