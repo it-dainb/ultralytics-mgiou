@@ -75,7 +75,7 @@ class PolygonValidator(DetectionValidator):
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.sigma = None
         self.np = None
-        self.args.task = "pose"
+        self.args.task = "polygon"
         self.metrics = PoseMetrics()
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
@@ -100,7 +100,7 @@ class PolygonValidator(DetectionValidator):
             "R",
             "mAP50",
             "mAP50-95)",
-            "Pose(P",
+            "Polygon(P",
             "R",
             "mAP50",
             "mAP50-95)",
@@ -272,4 +272,4 @@ class PolygonValidator(DetectionValidator):
         """Evaluate object detection model using COCO JSON format."""
         anno_json = self.data["path"] / "annotations/person_keypoints_val2017.json"  # annotations
         pred_json = self.save_dir / "predictions.json"  # predictions
-        return super().coco_evaluate(stats, pred_json, anno_json, ["bbox", "keypoints"], suffix=["Box", "Pose"])
+        return super().coco_evaluate(stats, pred_json, anno_json, ["bbox", "keypoints"], suffix=["Box", "Polygon"])

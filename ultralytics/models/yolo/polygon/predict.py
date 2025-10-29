@@ -46,7 +46,7 @@ class PolygonPredictor(DetectionPredictor):
             >>> predictor.predict_cli()
         """
         super().__init__(cfg, overrides, _callbacks)
-        self.args.task = "pose"
+        self.args.task = "polygon"
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
                 "Apple MPS known Pose bug. Recommend 'device=cpu' for Pose models. "
