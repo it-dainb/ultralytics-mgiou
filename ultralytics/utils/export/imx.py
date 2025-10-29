@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from ultralytics.nn.modules import Detect, Pose
+from ultralytics.nn.modules import Detect, Pose, Polygon
 from ultralytics.utils import LOGGER
 from ultralytics.utils.tal import make_anchors
 from ultralytics.utils.torch_utils import copy_attr
@@ -68,6 +68,8 @@ class FXModel(torch.nn.Module):
                 )
             if type(m) is Pose:
                 m.forward = types.MethodType(pose_forward, m)  # bind method to Detect
+            if type(m) is Polygon:
+                m.forward = types.MethodType(polygon_forward, m)  # bind method to Detect
             x = m(x)  # run
             y.append(x)  # save output
         return x
@@ -88,6 +90,14 @@ def pose_forward(self, x: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tenso
     x = Detect.forward(self, x)
     pred_kpt = self.kpts_decode(bs, kpt)
     return (*x, pred_kpt.permute(0, 2, 1))
+
+def polygon_forward(self, x: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward pass for imx polygon estimation, including polygon decoding."""
+    bs = x[0].shape[0]  # batch size
+    poly = torch.cat([self.cv4[i](x[i]).view(bs, self.np, -1) for i in range(self.nl)], -1)  # (bs, num_points*2, h*w)
+    x = Detect.forward(self, x)
+    pred_poly = self.poly_decode(bs, poly)
+    return (*x, pred_poly.permute(0, 2, 1))
 
 
 class NMSWrapper(torch.nn.Module):

@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
+__all__ = "Detect", "Segment", "Pose", "Polygon", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
 
 
 class Detect(nn.Module):
@@ -418,6 +418,58 @@ class Pose(Detect):
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
+
+
+class Polygon(Detect):
+    """
+    YOLO Polygon head for predicting polygon vertices (e.g., masks or contours).
+
+    Attributes:
+        poly_shape (tuple): Number of vertices and dimensions (2 for x,y).
+        npoly (int): Total number of polygon values = num_points * dims.
+        cv4 (nn.ModuleList): Convolution layers for polygon prediction.
+
+    Example:
+        >>> poly = Polygon(nc=80, poly_shape=(8, 2), ch=(256, 512, 1024))
+        >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
+        >>> outputs = poly(x)
+    """
+
+    def __init__(self, nc: int = 80, np: int = 8, ch: tuple = ()):
+        """
+        Initialize YOLO Polygon head.
+
+        Args:
+            nc (int): Number of classes.
+            poly_shape (tuple): (num_vertices, dims=2 for x,y).
+            ch (tuple): Tuple of channel sizes from backbone feature maps.
+        """
+        super().__init__(nc, ch)
+        self.poly_shape = (np, 2)  # (num_points, 2)
+        self.npoly = self.poly_shape[0] * self.poly_shape[1]  # total polygon outputs
+
+        c4 = max(ch[0] // 4, self.npoly)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.npoly, 1)) for x in ch)
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
+        """Perform forward pass through YOLO model and return predictions."""
+        bs = x[0].shape[0]  # batch size
+        poly = torch.cat([self.cv4[i](x[i]).view(bs, self.npoly, -1) for i in range(self.nl)], -1)
+        x = Detect.forward(self, x)
+        if self.training:
+            return x, poly
+        pred_poly = self.polygons_decode(bs, poly)
+        return torch.cat([x, pred_poly], 1) if self.export else (torch.cat([x[0], pred_poly], 1), (x[1], poly))
+
+    def polygons_decode(self, bs: int, polys: torch.Tensor) -> torch.Tensor:
+        """Decode polygon vertex predictions."""
+        ndim = self.poly_shape[1]
+        y = polys.clone()
+        # Decode (x, y) coordinates relative to anchor grid and strides
+        y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+        y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+        return y
+
 
 
 class Classify(nn.Module):

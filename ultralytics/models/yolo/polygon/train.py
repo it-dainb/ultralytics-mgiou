@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import PoseModel
+from ultralytics.nn.tasks import PolygonModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER
 
 
-class PoseTrainer(yolo.detect.DetectionTrainer):
+class PolygonTrainer(yolo.detect.DetectionTrainer):
     """
     A class extending the DetectionTrainer class for training YOLO pose estimation models.
 
@@ -20,16 +20,16 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
 
     Attributes:
         args (dict): Configuration arguments for training.
-        model (PoseModel): The pose estimation model being trained.
-        data (dict): Dataset configuration including keypoint shape information.
+        model (PolygonModel): The polygon model being trained.
+        data (dict): Dataset configuration including polygon shape information.
         loss_names (tuple): Names of the loss components used in training.
 
     Methods:
-        get_model: Retrieve a pose estimation model with specified configuration.
-        set_model_attributes: Set keypoints shape attribute on the model.
+        get_model: Retrieve a polygon model with specified configuration.
+        set_model_attributes: Set polygon shape attribute on the model.
         get_validator: Create a validator instance for model evaluation.
-        plot_training_samples: Visualize training samples with keypoints.
-        get_dataset: Retrieve the dataset and ensure it contains required kpt_shape key.
+        plot_training_samples: Visualize training samples with polygons.
+        get_dataset: Retrieve the dataset and ensure it contains required np key.
 
     Examples:
         >>> from ultralytics.models.yolo.pose import PoseTrainer
@@ -53,8 +53,9 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         """
         if overrides is None:
             overrides = {}
-        overrides["task"] = "pose"
+        overrides["task"] = "polygon"
         super().__init__(cfg, overrides, _callbacks)
+        self.use_mgiou = overrides.get("use_mgiou", False)
 
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
@@ -67,7 +68,7 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         cfg: str | Path | dict[str, Any] | None = None,
         weights: str | Path | None = None,
         verbose: bool = True,
-    ) -> PoseModel:
+    ) -> PolygonModel:
         """
         Get pose estimation model with specified configuration and weights.
 
@@ -77,15 +78,10 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
             verbose (bool): Whether to display model information.
 
         Returns:
-            (PoseModel): Initialized pose estimation model.
+            (PolygonModel): Initialized pose estimation model.
         """
-        model = PoseModel(
-            cfg,
-            nc=self.data["nc"],
-            ch=self.data["channels"],
-            data_kpt_shape=self.data["kpt_shape"],
-            verbose=verbose,
-            use_mgiou=getattr(self.args, "use_mgiou", False),
+        model = PolygonModel(
+            cfg, nc=self.data["nc"], ch=self.data["channels"], data_np=self.data["np"], verbose=verbose, use_mgiou=self.use_mgiou
         )
         if weights:
             model.load(weights)
@@ -93,28 +89,28 @@ class PoseTrainer(yolo.detect.DetectionTrainer):
         return model
 
     def set_model_attributes(self):
-        """Set keypoints shape attribute of PoseModel."""
+        """Set keypoints shape attribute of PolygonModel."""
         super().set_model_attributes()
-        self.model.kpt_shape = self.data["kpt_shape"]
+        self.model.np = self.data["np"]
 
     def get_validator(self):
-        """Return an instance of the PoseValidator class for validation."""
-        self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss", "mgiou_loss"
-        return yolo.pose.PoseValidator(
+        """Return an instance of the PolygonValidator class for validation."""
+        self.loss_names = "box_loss", "polygon_loss", "cls_loss", "dfl_loss", "mgiou_loss"
+        return yolo.polygon.PolygonValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
 
     def get_dataset(self) -> dict[str, Any]:
         """
-        Retrieve the dataset and ensure it contains the required `kpt_shape` key.
+        Retrieve the dataset and ensure it contains the required `np` key.
 
         Returns:
             (dict): A dictionary containing the training/validation/test dataset and category names.
 
         Raises:
-            KeyError: If the `kpt_shape` key is not present in the dataset.
+            KeyError: If the `np` key is not present in the dataset.
         """
         data = super().get_dataset()
-        if "kpt_shape" not in data:
-            raise KeyError(f"No `kpt_shape` in the {self.args.data}. See https://docs.ultralytics.com/datasets/pose/")
+        if "np" not in data:
+            raise KeyError(f"No `np` in the {self.args.data}. See https://docs.ultralytics.com/datasets/pose/")
         return data

@@ -16,6 +16,8 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
+_EPS = 1e-9
+
 class VarifocalLoss(nn.Module):
     """
     Varifocal loss by Zhang et al.
@@ -105,7 +107,7 @@ class DFLoss(nn.Module):
             + F.cross_entropy(pred_dist, tr.view(-1), reduction="none").view(tl.shape) * wr
         ).mean(-1, keepdim=True)
 
-class MGIoU2DLoss(nn.Module):
+class MGIoURect(nn.Module):
     """MGIoU loss for either rotated rectangles (x,y,w,h,θ) or explicit 4-corner boxes."""
     def __init__(
         self,
@@ -173,10 +175,15 @@ class MGIoU2DLoss(nn.Module):
         if weight is not None:
             weight = weight.view(-1) if weight.dim() > 1 else weight
             losses = losses * weight
+        
             if avg_factor is None:
                 avg_factor = weight.sum().clamp_min(1.0)
-        avg_factor = float(avg_factor or B)
-        loss = self._reduce(losses, red) / avg_factor
+
+        loss = self._reduce(losses, red)
+
+        if avg_factor is not None:
+            loss = loss / avg_factor
+        
         return (loss * self.loss_weight).to(pred.dtype)
 
     def _mgiou_boxes(self, c1: torch.Tensor, c2: torch.Tensor) -> torch.Tensor:
@@ -188,15 +195,14 @@ class MGIoU2DLoss(nn.Module):
         mn1, mx1 = proj1.min(dim=1).values, proj1.max(dim=1).values
         mn2, mx2 = proj2.min(dim=1).values, proj2.max(dim=1).values
 
+        inter = (torch.minimum(mx1, mx2) - torch.maximum(mn1, mn2)).clamp(min=0.0)
+        hull  = (torch.maximum(mx1, mx2) - torch.minimum(mn1, mn2))
+        
         if self.fast_mode:
-            num = torch.minimum(mx1, mx2) - torch.maximum(mn1, mn2)
-            den = torch.maximum(mx1, mx2) - torch.minimum(mn1, mn2) + 0 # ESPilon to avoid zero division
-            giou1d = num / den
+            giou1d = inter / (hull + _EPS)
         else:
-            inter = (torch.minimum(mx1, mx2) - torch.maximum(mn1, mn2)).clamp(min=0.0)
             union = (mx1 - mn1) + (mx2 - mn2) - inter
-            hull  = (torch.maximum(mx1, mx2) - torch.minimum(mn1, mn2))
-            giou1d = inter / union - (hull - union) / hull
+            giou1d = inter / (union + _EPS) - (hull - union) / (hull + _EPS)
 
         return ((1.0 - giou1d.mean(dim=-1)) * 0.5)
 
@@ -227,13 +233,205 @@ class MGIoU2DLoss(nn.Module):
             return loss
         raise ValueError(f"Unsupported reduction: {reduction!r}")
 
+class MGIoUPoly(nn.Module):
+    """
+    MGIoU loss for general polygons with automatic degenerate edge detection.
+    
+    Supports:
+    - Mixed vertex counts in batches (e.g., triangles, quads, hexagons together)
+    - Automatic padding artifact detection and removal
+    - Weighted loss computation
+    - Flexible reduction strategies
+    """
+    def __init__(self, fast_mode=False, reduction="mean", loss_weight=1.0, eps=1e-6):
+        """
+        Initialize MGIoUPoly with optimization options.
+        
+        Args:
+            fast_mode: Use simplified GIoU computation (default: False)
+            reduction: Loss reduction method: 'none', 'mean', or 'sum' (default: 'mean')
+            loss_weight: Global weight for the loss (default: 1.0)
+            eps: Threshold for detecting degenerate edges (default: 1e-6)
+                 Edges with length < eps are considered padding artifacts
+        """
+        super().__init__()
+        if reduction not in {"none", "mean", "sum"}:
+            raise ValueError("reduction must be 'none', 'mean' or 'sum'")
+        
+        self.fast_mode = fast_mode
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.eps = eps
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        weight: torch.Tensor | None = None,
+        reduction_override: str | None = None,
+        avg_factor: float | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute MGIoU loss for polygon predictions.
+        
+        Args:
+            pred: Predicted polygons [B, N, 2] where N is max vertices (padded if needed)
+            target: Target polygons [B, M, 2] where M is max vertices (padded if needed)
+            weight: Per-sample weights [B] or [B, 1] (optional)
+            reduction_override: Override default reduction method (optional)
+            avg_factor: Normalization factor for loss (optional, computed from weights if not provided)
+            
+        Returns:
+            Computed loss value (scalar if reduction != 'none', else [B])
+        """
+        B, N, _ = pred.shape
+        M = target.shape[1]
+        
+        red = reduction_override or self.reduction
+        
+        # Detect completely degenerate targets (like MGIoURect strategy)
+        # This handles cases where target is all zeros or invalid
+        all_zero = (target.abs().sum(dim=(1, 2)) == 0)  # [B]
+        losses = pred.new_zeros(B)
+        
+        # Fallback to L1 loss for degenerate targets
+        if all_zero.any():
+            # Flatten polygons for L1 loss
+            pred_flat = pred[all_zero].view(all_zero.sum(), -1)
+            target_flat = target[all_zero].view(all_zero.sum(), -1)
+            l1 = F.l1_loss(pred_flat, target_flat, reduction="none")
+            losses[all_zero] = l1.sum(dim=1)
+        
+        # Compute MGIoU for valid targets
+        valid_mask = ~all_zero
+        if valid_mask.any():
+            # Extract valid samples
+            pred_valid = pred[valid_mask]
+            target_valid = target[valid_mask]
+            
+            # Sort vertices by angle to ensure consistent ordering
+            pred_sorted = self._sort_vertices(pred_valid)
+            target_sorted = self._sort_vertices(target_valid)
+
+            # Get axes and validity masks (detects degenerate edges from padding)
+            axes1, mask1 = self._axes_with_mask(pred_sorted)
+            axes2, mask2 = self._axes_with_mask(target_sorted)
+            
+            axes = torch.cat((axes1, axes2), dim=1)  # [B_valid, N+M, 2]
+            mask = torch.cat((mask1, mask2), dim=1)  # [B_valid, N+M] - True = valid, False = degenerate
+
+            # Project vertices onto all axes (vectorized)
+            proj1 = torch.bmm(pred_sorted, axes.transpose(1, 2))
+            proj2 = torch.bmm(target_sorted, axes.transpose(1, 2))
+            min1, _ = proj1.min(dim=1)
+            max1, _ = proj1.max(dim=1)
+            min2, _ = proj2.min(dim=1)
+            max2, _ = proj2.max(dim=1)
+
+            # Compute GIoU on each axis
+            inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
+            hull  = torch.maximum(max1, max2) - torch.minimum(min1, min2)
+
+            if self.fast_mode:
+                giou1d = inter / (hull + _EPS)
+            else:
+                # Match reference formula exactly: inter/union - (hull-union)/hull
+                union = (max1 - min1) + (max2 - min2) - inter
+                giou1d = inter / (union + _EPS) - (hull - union) / (hull + _EPS)
+
+            # *** KEY: Masked mean - only average over valid (non-degenerate) axes ***
+            # This allows correct batching of polygons with different vertex counts!
+            giou1d_masked = giou1d * mask  # zero out invalid axes
+            num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
+            giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
+            
+            losses[valid_mask] = (1.0 - giou_val) * 0.5
+        
+        # --- weighting & reduction (matching MGIoURect behavior) ---
+        if weight is not None:
+            weight = weight.view(-1) if weight.dim() > 1 else weight
+            losses = losses * weight
+            
+            if avg_factor is None:
+                avg_factor = weight.sum().clamp_min(1.0)
+        
+        loss = self._reduce(losses, red)
+        
+        if avg_factor is not None:
+            loss = loss / avg_factor
+        
+        return (loss * self.loss_weight).to(pred.dtype)
+
+    @staticmethod
+    def _sort_vertices(poly):
+        """Sort vertices by angle from centroid (like MGIoU2DPlus._candidate_axes)."""
+        B, N, _ = poly.shape
+        center = poly.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        angles = torch.atan2(poly[..., 1] - center[..., 1], poly[..., 0] - center[..., 0])  # [B, N]
+        indices = angles.argsort(dim=1)  # [B, N]
+        return torch.gather(poly, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
+
+    def _axes_with_mask(self, poly):
+        """
+        Compute edge normals and validity mask.
+        
+        Returns:
+            normals: [B, N, 2] - edge normal vectors
+            mask: [B, N] - True if edge is valid (length > eps), False if degenerate
+        
+        This automatically detects padding artifacts (repeated vertices) and excludes
+        their axes from the mean calculation, enabling correct mixed-vertex batching.
+        """
+        edges = poly.roll(-1, dims=1) - poly  # [B, N, 2]
+        edge_lengths = torch.norm(edges, dim=-1)  # [B, N]
+        
+        # Mark edges as valid if length > eps
+        # Degenerate edges (from padding) will have length ≈ 0
+        mask = edge_lengths > self.eps  # [B, N]
+        
+        # Compute normals using (dy, -dx) convention to match MGIoU2DPlus
+        normals = torch.stack((edges[..., 1], -edges[..., 0]), dim=-1)
+        return normals, mask
+    
+    @staticmethod
+    def _reduce(loss: torch.Tensor, reduction: str) -> torch.Tensor:
+        """Apply reduction to loss tensor."""
+        if reduction == "mean":
+            return loss.mean()
+        if reduction == "sum":
+            return loss.sum()
+        if reduction == "none":
+            return loss
+        raise ValueError(f"Unsupported reduction: {reduction!r}")
+
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
+    def __init__(self, reg_max: int, use_mgiou: bool = False):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.mgiou_loss = MGIoURect(representation="corner", reduction="sum") if use_mgiou else None
+
+    @staticmethod
+    def xyxy_to_corners(boxes: torch.Tensor) -> torch.Tensor:
+        """
+        Convert bounding boxes from (x1, y1, x2, y2) format to 4 corner points.
+        
+        Args:
+            boxes: Tensor of shape (N, 4) in (x1, y1, x2, y2) format
+            
+        Returns:
+            Tensor of shape (N, 4, 2) representing 4 corner points for each box
+        """
+        x1, y1, x2, y2 = boxes.unbind(-1)
+        corners = torch.stack([
+            torch.stack([x1, y1], dim=-1),  # top-left
+            torch.stack([x2, y1], dim=-1),  # top-right
+            torch.stack([x2, y2], dim=-1),  # bottom-right
+            torch.stack([x1, y2], dim=-1),  # bottom-left
+        ], dim=1)
+        return corners
 
     def forward(
         self,
@@ -244,13 +442,26 @@ class BboxLoss(nn.Module):
         target_scores: torch.Tensor,
         target_scores_sum: torch.Tensor,
         fg_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for bounding boxes."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute IoU and DFL losses for bounding boxes. Returns (loss_iou, loss_dfl, mgiou_loss)."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
-        # DFL loss
+        if self.mgiou_loss:
+            pred_corners = self.xyxy_to_corners(pred_bboxes[fg_mask])
+            target_corners = self.xyxy_to_corners(target_bboxes[fg_mask].to(pred_bboxes.dtype))
+            
+            mgiou_loss = self.mgiou_loss(
+                pred_corners,
+                target_corners,
+                weight=weight.to(pred_bboxes.dtype),
+                avg_factor=target_scores_sum
+            )
+            loss_iou = mgiou_loss
+        else:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+            mgiou_loss = torch.tensor(0.0).to(pred_dist.device)
+
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
             loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
@@ -258,7 +469,7 @@ class BboxLoss(nn.Module):
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
-        return loss_iou, loss_dfl
+        return loss_iou, loss_dfl, mgiou_loss
 
 
 class RotatedBboxLoss(BboxLoss):
@@ -267,7 +478,7 @@ class RotatedBboxLoss(BboxLoss):
     def __init__(self, reg_max: int, use_mgiou: bool = False):
         """Initialize the RotatedBboxLoss module with regularization maximum and DFL settings."""
         super().__init__(reg_max)
-        self.mgiou_loss = MGIoU2DLoss(representation="rect", reduction="sum") if use_mgiou else None
+        self.mgiou_loss = MGIoURect(representation="rect", reduction="sum") if use_mgiou else None
 
     def forward(
         self,
@@ -278,22 +489,23 @@ class RotatedBboxLoss(BboxLoss):
         target_scores: torch.Tensor,
         target_scores_sum: torch.Tensor,
         fg_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for rotated bounding boxes."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute IoU and DFL losses for rotated bounding boxes. Returns (loss_iou, loss_dfl, mgiou_loss)."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
 
         if self.mgiou_loss:
-            loss_iou = self.mgiou_loss(
+            mgiou_loss = self.mgiou_loss(
                 pred_bboxes[fg_mask],
                 target_bboxes[fg_mask].to(pred_bboxes.dtype),
                 weight=weight.to(pred_bboxes.dtype),
                 avg_factor=target_scores_sum
             )
+            loss_iou = mgiou_loss
         else:
             iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
             loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+            mgiou_loss = torch.tensor(0.0).to(pred_dist.device)
 
-        # DFL loss
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, xywh2xyxy(target_bboxes[..., :4]), self.dfl_loss.reg_max - 1)
             loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
@@ -301,7 +513,7 @@ class RotatedBboxLoss(BboxLoss):
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
-        return loss_iou, loss_dfl
+        return loss_iou, loss_dfl, mgiou_loss
 
 
 class KeypointLoss(nn.Module):
@@ -323,10 +535,53 @@ class KeypointLoss(nn.Module):
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
 
+class PolygonLoss(nn.Module):
+    """Criterion class for computing polygon losses using MGIoU or L2 distance."""
+
+    def __init__(self, use_mgiou: bool = False) -> None:
+        """Initialize the PolygonLoss class with optional MGIoU loss."""
+        super().__init__()  # dummy sigma, not used
+        self.mgiou_loss = MGIoUPoly(reduction="mean") if use_mgiou else None
+
+    def forward(
+        self, pred_kpts: torch.Tensor, gt_kpts: torch.Tensor, kpt_mask: torch.Tensor, area: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate polygon loss using MGIoU or fallback to L2 distance.
+        
+        Args:
+            pred_kpts: Predicted polygon vertices, shape (N, num_vertices, 2 or 3)
+            gt_kpts: Ground truth polygon vertices, shape (N, num_vertices, 2 or 3)
+            kpt_mask: Mask indicating valid vertices, shape (N, num_vertices)
+            area: Area of bounding boxes, shape (N, 1)
+            
+        Returns:
+            Tuple of (total_loss, mgiou_loss) where mgiou_loss is 0 if not using MGIoU
+        """
+        if self.mgiou_loss:
+            pred_poly = pred_kpts[..., :2]
+            gt_poly = gt_kpts[..., :2]
+            
+            weights = area.squeeze(-1)
+            
+            mgiou_losses = self.mgiou_loss(pred_poly, gt_poly, weight=weights)
+            
+            total_loss = mgiou_losses.mean()
+            return total_loss, total_loss
+        else:
+            d = (pred_kpts[..., 0] - gt_kpts[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_kpts[..., 1]).pow(2)
+            kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
+            
+            e = d / (area + 1e-9)
+            
+            l2_loss = (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
+            mgiou_loss = torch.tensor(0.0).to(pred_kpts.device)
+            return l2_loss, mgiou_loss
+
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
-    def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
+    def __init__(self, model, tal_topk: int = 10, use_mgiou: bool = False):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -339,11 +594,12 @@ class v8DetectionLoss:
         self.no = m.nc + m.reg_max * 4
         self.reg_max = m.reg_max
         self.device = device
+        self.use_mgiou = use_mgiou
 
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, use_mgiou=use_mgiou).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -373,8 +629,8 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        """Calculate the total loss and detach it for detection."""
+        loss = torch.zeros(4, device=self.device)
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -385,22 +641,17 @@ class v8DetectionLoss:
 
         dtype = pred_scores.dtype
         batch_size = pred_scores.shape[0]
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
-        # Targets
         targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
-        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
 
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -411,13 +662,10 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
-        # Bbox loss
         if fg_mask.sum():
-            loss[0], loss[2] = self.bbox_loss(
+            loss[0], loss[2], loss[3] = self.bbox_loss(
                 pred_distri,
                 pred_bboxes,
                 anchor_points,
@@ -427,11 +675,13 @@ class v8DetectionLoss:
                 fg_mask,
             )
 
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
-
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        loss[2] *= self.hyp.dfl
+        if self.use_mgiou:
+            loss[3] *= self.hyp.box
+        
+        return loss * batch_size, loss.detach()
 
 
 class v8SegmentationLoss(v8DetectionLoss):
@@ -620,9 +870,9 @@ class v8SegmentationLoss(v8DetectionLoss):
 class v8PoseLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 pose estimation."""
 
-    def __init__(self, model):  # model must be de-paralleled
+    def __init__(self, model, use_mgiou=False):  # model must be de-paralleled
         """Initialize v8PoseLoss with model parameters and keypoint-specific loss functions."""
-        super().__init__(model)
+        super().__init__(model, use_mgiou=use_mgiou)
         self.kpt_shape = model.model[-1].kpt_shape
         self.bce_pose = nn.BCEWithLogitsLoss()
         is_pose = self.kpt_shape == [17, 3]
@@ -632,32 +882,29 @@ class v8PoseLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the total loss and detach it for pose estimation."""
-        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
+        loss = torch.zeros(6, device=self.device)
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
         )
 
-        # B, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
         pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
 
         dtype = pred_scores.dtype
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
-        # Targets
         batch_size = pred_scores.shape[0]
         batch_idx = batch["batch_idx"].view(-1, 1)
         targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        pred_kpts = self.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape))  # (b, h*w, 17, 3)
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        pred_kpts = self.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape))
 
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
@@ -670,14 +917,11 @@ class v8PoseLoss(v8DetectionLoss):
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[3] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
-        # Bbox loss
         if fg_mask.sum():
             target_bboxes /= stride_tensor
-            loss[0], loss[4] = self.bbox_loss(
+            loss[0], loss[4], loss[5] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
             keypoints = batch["keypoints"].to(self.device).float().clone()
@@ -688,13 +932,15 @@ class v8PoseLoss(v8DetectionLoss):
                 fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
             )
 
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.pose  # pose gain
-        loss[2] *= self.hyp.kobj  # kobj gain
-        loss[3] *= self.hyp.cls  # cls gain
-        loss[4] *= self.hyp.dfl  # dfl gain
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.pose
+        loss[2] *= self.hyp.kobj
+        loss[3] *= self.hyp.cls
+        loss[4] *= self.hyp.dfl
+        if self.use_mgiou:
+            loss[5] *= self.hyp.box
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach()
 
     @staticmethod
     def kpts_decode(anchor_points: torch.Tensor, pred_kpts: torch.Tensor) -> torch.Tensor:
@@ -779,6 +1025,113 @@ class v8PoseLoss(v8DetectionLoss):
         return kpts_loss, kpts_obj_loss
 
 
+
+class v8PolygonLoss(v8DetectionLoss):
+
+    def __init__(self, model, use_mgiou: bool = False):
+        super().__init__(model)
+        self.poly_shape = model.model[-1].poly_shape
+        self.bce_poly = nn.BCEWithLogitsLoss()
+        npoly = self.poly_shape[0]
+        self.polygon_loss = PolygonLoss(use_mgiou=use_mgiou)
+        self.use_mgiou = use_mgiou
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        loss = torch.zeros(5, device=self.device)
+        feats, pred_poly = preds if isinstance(preds[0], list) else preds[1]
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        pred_poly = pred_poly.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        batch_size = pred_scores.shape[0]
+        batch_idx = batch["batch_idx"].view(-1, 1)
+        targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        pred_poly = self.poly_decode(anchor_points, pred_poly.view(batch_size, -1, *self.poly_shape))
+
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[3], loss[4] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+            polygons = batch["polygons"].to(self.device).float().clone()
+            polygons[..., 0] *= imgsz[1]
+            polygons[..., 1] *= imgsz[0]
+
+            loss[1] = self.calculate_polygon_loss(
+                fg_mask, target_gt_idx, polygons, batch_idx, stride_tensor, target_bboxes, pred_poly
+            )
+
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.polygon
+        loss[2] *= self.hyp.cls
+        loss[3] *= self.hyp.dfl
+        if self.use_mgiou:
+            loss[4] *= self.hyp.box
+
+        return loss * batch_size, loss.detach()
+
+    @staticmethod
+    def poly_decode(anchor_points: torch.Tensor, pred_poly: torch.Tensor) -> torch.Tensor:
+        y = pred_poly.clone()
+        y[..., :2] *= 2.0
+        y[..., 0] += anchor_points[:, [0]] - 0.5
+        y[..., 1] += anchor_points[:, [1]] - 0.5
+        return y
+
+    def calculate_polygon_loss(
+        self,
+        masks: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+        gt_poly: torch.Tensor,
+        batch_idx: torch.Tensor,
+        stride_tensor: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        pred_poly: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_idx = batch_idx.flatten()
+        polys_loss = torch.zeros(1, device=self.device)
+
+        for i in range(pred_poly.shape[0]):
+            fg_mask_i = masks[i]
+            if fg_mask_i.sum():
+                target_gt_idx_i = target_gt_idx[i][fg_mask_i]
+                gt_matching_bs = batch_idx[target_gt_idx_i]
+                gt_poly_scaled = gt_poly[gt_matching_bs]
+                gt_poly_scaled[..., 0] /= stride_tensor[i]
+                gt_poly_scaled[..., 1] /= stride_tensor[i]
+                area = xyxy2xywh(target_bboxes[i][fg_mask_i])[:, 2:].prod(1, keepdim=True)
+                pred_poly_i = pred_poly[i][fg_mask_i]
+                poly_mask = torch.full_like(gt_poly_scaled[..., 0], True)
+                polys_loss += self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
+
+        return polys_loss
+
 class v8ClassificationLoss:
     """Criterion class for computing training losses for classification."""
 
@@ -818,7 +1171,7 @@ class v8OBBLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, mgiou_loss
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -876,7 +1229,7 @@ class v8OBBLoss(v8DetectionLoss):
         # Bbox loss
         if fg_mask.sum():
             target_bboxes[..., :4] /= stride_tensor
-            loss[0], loss[2] = self.bbox_loss(
+            loss[0], loss[2], loss[3] = self.bbox_loss(
                 pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
         else:
@@ -885,8 +1238,10 @@ class v8OBBLoss(v8DetectionLoss):
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+        if self.use_mgiou:
+            loss[3] *= self.hyp.box
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, mgiou_loss)
 
     def bbox_decode(
         self, anchor_points: torch.Tensor, pred_dist: torch.Tensor, pred_angle: torch.Tensor

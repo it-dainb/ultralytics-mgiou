@@ -55,6 +55,7 @@ from ultralytics.nn.modules import (
     Index,
     LRPCHead,
     Pose,
+    Polygon,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -77,6 +78,7 @@ from ultralytics.utils.loss import (
     v8DetectionLoss,
     v8OBBLoss,
     v8PoseLoss,
+    v8PolygonLoss,
     v8SegmentationLoss,
 )
 from ultralytics.utils.ops import make_divisible
@@ -372,7 +374,7 @@ class DetectionModel(BaseModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True, use_mgiou=False):
         """
         Initialize the YOLO detection model with the given config and parameters.
 
@@ -381,8 +383,10 @@ class DetectionModel(BaseModel):
             ch (int): Number of input channels.
             nc (int, optional): Number of classes.
             verbose (bool): Whether to display model information.
+            use_mgiou (bool): Whether to use MGIoU loss for bounding box regression.
         """
         super().__init__()
+        self.use_mgiou = use_mgiou
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
         if self.yaml["backbone"][0][2] == "Silence":
             LOGGER.warning(
@@ -411,7 +415,7 @@ class DetectionModel(BaseModel):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB, Polygon)) else self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m.training = True  # Setting it to True to properly return strides
@@ -497,7 +501,7 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self, use_mgiou=getattr(self, "use_mgiou", False))
 
 
 class OBBModel(DetectionModel):
@@ -589,7 +593,7 @@ class PoseModel(DetectionModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n-pose.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+    def __init__(self, cfg="yolo11n-pose.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True, use_mgiou=False):
         """
         Initialize Ultralytics YOLO Pose model.
 
@@ -599,17 +603,64 @@ class PoseModel(DetectionModel):
             nc (int, optional): Number of classes.
             data_kpt_shape (tuple): Shape of keypoints data.
             verbose (bool): Whether to display model information.
+            use_mgiou (bool): Whether to use MGIoU loss for bounding box regression.
         """
         if not isinstance(cfg, dict):
             cfg = yaml_model_load(cfg)  # load model YAML
         if any(data_kpt_shape) and list(data_kpt_shape) != list(cfg["kpt_shape"]):
             LOGGER.info(f"Overriding model.yaml kpt_shape={cfg['kpt_shape']} with kpt_shape={data_kpt_shape}")
             cfg["kpt_shape"] = data_kpt_shape
-        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose, use_mgiou=use_mgiou)
+        self.use_mgiou = use_mgiou
+        
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
-        return v8PoseLoss(self)
+        return v8PoseLoss(self, use_mgiou=self.use_mgiou)
+
+
+class PolygonModel(DetectionModel):
+    """
+    YOLO polygon model.
+
+    This class extends DetectionModel to handle polygon detection tasks, providing specialized
+    loss computation for polygonal object detection.
+
+    Attributes:
+        np (int): Number of polygon points.
+
+    Methods:
+        __init__: Initialize YOLO polygon model.
+        init_criterion: Initialize the loss criterion for polygon detection.
+
+    Examples:
+        Initialize a polygon model
+        >>> model = PolygonModel("yolo11n-polygon.yaml", ch=3, nc=1, data_np=3)
+        >>> results = model.predict(image_tensor)
+    """
+
+    def __init__(self, cfg="yolo11n-polygon.yaml", ch=3, nc=None, data_np=3, verbose=True, use_mgiou=False):
+        """
+        Initialize Ultralytics YOLO Polygon model.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            data_np (tuple): Number of polygon points data.
+            verbose (bool): Whether to display model information.
+            use_mgiou (bool): Whether to use MGIoU loss.
+        """
+        if not isinstance(cfg, dict):
+            cfg = yaml_model_load(cfg)  # load model YAML
+        if any(data_np) and int(data_np) != int(cfg["np"]):
+            LOGGER.info(f"Overriding model.yaml np={cfg['np']} with np={data_np}")
+            cfg["np"] = data_np
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        self.use_mgiou = use_mgiou
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the PolygonModel."""
+        return v8PolygonLoss(self, use_mgiou=self.use_mgiou)
 
 
 class ClassificationModel(BaseModel):
@@ -1666,12 +1717,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, Polygon}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, Polygon}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1750,7 +1801,7 @@ def guess_model_task(model):
         model (torch.nn.Module | dict): PyTorch model or model configuration in YAML format.
 
     Returns:
-        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'obb').
+        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'polygon', 'obb').
     """
 
     def cfg2task(cfg):
@@ -1764,6 +1815,8 @@ def guess_model_task(model):
             return "segment"
         if m == "pose":
             return "pose"
+        if m == "polygon":
+            return "polygon"
         if m == "obb":
             return "obb"
 
@@ -1788,6 +1841,8 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
+            elif isinstance(m, Polygon):
+                return "polygon"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 
@@ -1800,6 +1855,8 @@ def guess_model_task(model):
             return "classify"
         elif "-pose" in model.stem or "pose" in model.parts:
             return "pose"
+        elif "-poly" in model.stem or "polygon" in model.parts:
+            return "polygon"
         elif "-obb" in model.stem or "obb" in model.parts:
             return "obb"
         elif "detect" in model.parts:
@@ -1808,6 +1865,6 @@ def guess_model_task(model):
     # Unable to determine task from model
     LOGGER.warning(
         "Unable to automatically guess model task, assuming 'task=detect'. "
-        "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."
+        "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose', 'polygon', or 'obb'."
     )
     return "detect"  # assume detect
