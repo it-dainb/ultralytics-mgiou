@@ -300,7 +300,7 @@ class MGIoUPoly(nn.Module):
             pred_flat = pred[all_zero].view(all_zero.sum(), -1)
             target_flat = target[all_zero].view(all_zero.sum(), -1)
             l1 = F.l1_loss(pred_flat, target_flat, reduction="none")
-            losses[all_zero] = l1.sum(dim=1)
+            losses[all_zero] = l1.sum(dim=1).to(losses.dtype)
         
         # Compute MGIoU for valid targets
         valid_mask = ~all_zero
@@ -345,7 +345,7 @@ class MGIoUPoly(nn.Module):
             num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
             giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
             
-            losses[valid_mask] = (1.0 - giou_val) * 0.5
+            losses[valid_mask] = ((1.0 - giou_val) * 0.5).to(losses.dtype)
         
         # --- weighting & reduction (matching MGIoURect behavior) ---
         if weight is not None:

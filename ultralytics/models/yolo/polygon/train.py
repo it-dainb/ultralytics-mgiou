@@ -129,14 +129,3 @@ class PolygonTrainer(yolo.detect.DetectionTrainer):
                     f"Please specify the number of polygon points in your model or dataset YAML."
                 )
         return data
-%cd /content/
-
-!YOLO_VERBOSE=True yolo polygon \
-train data=./datasets/final/cc_obb.yaml \
-model=./polygon.yaml \
-use_mgiou=True single_cls=True dfl=0 \
-optimizer='AdamW' lr0=0.005 dropout=0.01 cos_lr=True\
-epochs=100 patience=0 batch=0.9 \
-imgsz={IMG_SIZE} rect=True \
-plots=True compile=False pretrained=False augment=True auto_augment=autoaugment \
-project=/content/drive/MyDrive/DFS/DIGI_TEXX/1998_CC_03/models name=phase1 exist_ok=True
