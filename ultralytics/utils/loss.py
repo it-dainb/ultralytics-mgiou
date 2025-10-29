@@ -341,11 +341,11 @@ class MGIoUPoly(nn.Module):
 
             # *** KEY: Masked mean - only average over valid (non-degenerate) axes ***
             # This allows correct batching of polygons with different vertex counts!
-            giou1d_masked = giou1d * mask  # zero out invalid axes
+            giou1d_masked = giou1d * mask.to(giou1d.dtype)  # zero out invalid axes
             num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
             giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
             
-            losses[valid_mask] = ((1.0 - giou_val) * 0.5).to(losses.dtype)
+            losses[valid_mask] = ((1.0 - giou_val) * 0.5)
         
         # --- weighting & reduction (matching MGIoURect behavior) ---
         if weight is not None:
@@ -390,7 +390,7 @@ class MGIoUPoly(nn.Module):
         mask = edge_lengths > self.eps  # [B, N]
         
         # Compute normals using (dy, -dx) convention to match MGIoU2DPlus
-        normals = torch.stack((edges[..., 1], -edges[..., 0]), dim=-1)
+        normals = torch.stack((edges[..., 1], -edges[..., 0]), dim=-1).to(edges.dtype)
         return normals, mask
     
     @staticmethod
