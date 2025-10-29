@@ -114,8 +114,10 @@ class PolygonValidator(DetectionValidator):
         """
         super().init_metrics(model)
         self.np = self.data["np"]
-        is_pose = self.np == [17, 3]
-        nkpt = self.np[0]
+        # For polygon task, np is just an integer (number of points)
+        # For pose task, it would be a list like [17, 3]
+        is_pose = isinstance(self.np, list) and self.np == [17, 3]
+        nkpt = self.np[0] if isinstance(self.np, list) else self.np
         self.sigma = OKS_SIGMA if is_pose else np.ones(nkpt) / nkpt
 
     def postprocess(self, preds: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -145,7 +147,12 @@ class PolygonValidator(DetectionValidator):
         """
         preds = super().postprocess(preds)
         for pred in preds:
-            pred["keypoints"] = pred.pop("extra").view(-1, *self.np)  # remove extra if exists
+            # For polygon: self.np is int (e.g., 4), reshape to (N, np, 2)
+            # For pose: self.np is list [17, 3], reshape to (N, 17, 3)
+            if isinstance(self.np, list):
+                pred["keypoints"] = pred.pop("extra").view(-1, *self.np)
+            else:
+                pred["keypoints"] = pred.pop("extra").view(-1, self.np, 2)
         return preds
 
     def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
@@ -164,12 +171,12 @@ class PolygonValidator(DetectionValidator):
             Keypoints are scaled from normalized coordinates to original image dimensions.
         """
         pbatch = super()._prepare_batch(si, batch)
-        kpts = batch["keypoints"][batch["batch_idx"] == si]
+        polygons = batch["polygons"][batch["batch_idx"] == si]
         h, w = pbatch["imgsz"]
-        kpts = kpts.clone()
-        kpts[..., 0] *= w
-        kpts[..., 1] *= h
-        pbatch["keypoints"] = kpts
+        polygons = polygons.clone()
+        polygons[..., 0] *= w
+        polygons[..., 1] *= h
+        pbatch["keypoints"] = polygons  # Store as keypoints for compatibility with pose metrics
         return pbatch
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:

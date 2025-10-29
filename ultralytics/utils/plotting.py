@@ -719,7 +719,7 @@ def plot_images(
         - 3 channels: Used as-is (standard RGB)
         - 4+ channels: Cropped to first 3 channels
     """
-    for k in {"cls", "bboxes", "conf", "masks", "keypoints", "batch_idx", "images"}:
+    for k in {"cls", "bboxes", "conf", "masks", "keypoints", "polygons", "batch_idx", "images"}:
         if k not in labels:
             continue
         if k == "cls" and labels[k].ndim == 2:
@@ -733,6 +733,7 @@ def plot_images(
     confs = labels.get("conf", None)
     masks = labels.get("masks", np.zeros(0, dtype=np.uint8))
     kpts = labels.get("keypoints", np.zeros(0, dtype=np.float32))
+    polygons = labels.get("polygons", np.zeros((0, 4, 2), dtype=np.float32))
     images = labels.get("img", images)  # default to input images
 
     if len(images) and isinstance(images, torch.Tensor):
@@ -850,6 +851,33 @@ def plot_images(
                         except Exception:
                             pass
                 annotator.fromarray(im)
+
+            # Plot polygons
+            if len(polygons):
+                polygons_ = polygons[idx].copy()
+                conf = confs[idx] if confs is not None else None
+                if len(polygons_):
+                    # Check if normalized
+                    if polygons_[..., 0].max() <= 1.01 or polygons_[..., 1].max() <= 1.01:
+                        polygons_[..., 0] *= w  # scale to pixels
+                        polygons_[..., 1] *= h
+                    elif scale < 1:  # absolute coords need scale if image scales
+                        polygons_ *= scale
+                    polygons_[..., 0] += x
+                    polygons_[..., 1] += y
+                    
+                    im = np.asarray(annotator.im).copy()
+                    for j in range(len(polygons_)):
+                        if labels or (conf is not None and conf[j] > conf_thres):
+                            color = colors(classes[j])
+                            # Draw filled polygon with transparency
+                            polygon_points = polygons_[j].astype(np.int32).reshape((-1, 1, 2))
+                            overlay = im.copy()
+                            cv2.fillPoly(overlay, [polygon_points], color)
+                            im = cv2.addWeighted(im, 0.6, overlay, 0.4, 0)
+                            # Draw polygon outline
+                            cv2.polylines(im, [polygon_points], True, color, thickness=2)
+                    annotator.fromarray(im)
     if not save:
         return np.asarray(annotator.im)
     annotator.im.save(fname)  # save
