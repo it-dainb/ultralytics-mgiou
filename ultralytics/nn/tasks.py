@@ -372,7 +372,7 @@ class DetectionModel(BaseModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True, use_mgiou=False):
         """
         Initialize the YOLO detection model with the given config and parameters.
 
@@ -381,6 +381,7 @@ class DetectionModel(BaseModel):
             ch (int): Number of input channels.
             nc (int, optional): Number of classes.
             verbose (bool): Whether to display model information.
+            use_mgiou (bool): Whether to use MGIoU loss.
         """
         super().__init__()
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
@@ -398,6 +399,7 @@ class DetectionModel(BaseModel):
             self.yaml["nc"] = nc  # override YAML value
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
+        self.use_mgiou = use_mgiou
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
 
@@ -497,7 +499,7 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self, use_mgiou=self.use_mgiou)
 
 
 class OBBModel(DetectionModel):
@@ -552,7 +554,7 @@ class SegmentationModel(DetectionModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n-seg.yaml", ch=3, nc=None, verbose=True, use_mgiou=False):
+    def __init__(self, cfg="yolo11n-seg.yaml", ch=3, nc=None, verbose=True, use_mgiou=False, only_mgiou=False):
         """
         Initialize Ultralytics YOLO segmentation model with given config and parameters.
 
@@ -561,13 +563,16 @@ class SegmentationModel(DetectionModel):
             ch (int): Number of input channels.
             nc (int, optional): Number of classes.
             verbose (bool): Whether to display model information.
+            use_mgiou (bool): Whether to use MGIoU loss for masks.
+            only_mgiou (bool): Whether to use only MGIoU loss (disabling BCE mask loss).
         """
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.use_mgiou = use_mgiou
+        self.only_mgiou = only_mgiou and use_mgiou  # only_mgiou requires use_mgiou
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
-        return v8SegmentationLoss(self, use_mgiou=self.use_mgiou)
+        return v8SegmentationLoss(self, use_mgiou=self.use_mgiou, only_mgiou=self.only_mgiou)
 
 
 class PoseModel(DetectionModel):

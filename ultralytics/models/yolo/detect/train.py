@@ -62,7 +62,10 @@ class DetectionTrainer(BaseTrainer):
             overrides (dict, optional): Dictionary of parameter overrides for the default configuration.
             _callbacks (list, optional): List of callback functions to be executed during training.
         """
+        if overrides is None:
+            overrides = {}
         super().__init__(cfg, overrides, _callbacks)
+        self.use_mgiou = overrides.get("use_mgiou", False)
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         """
@@ -161,7 +164,7 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (DetectionModel): YOLO detection model.
         """
-        model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1, use_mgiou=self.use_mgiou)
         if weights:
             model.load(weights)
         return model
@@ -169,6 +172,8 @@ class DetectionTrainer(BaseTrainer):
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        if self.use_mgiou:
+            self.loss_names += ("mgiou_loss",)
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

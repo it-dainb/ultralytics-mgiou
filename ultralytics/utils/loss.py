@@ -584,16 +584,17 @@ class v8DetectionLoss:
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 
-    def __init__(self, model, use_mgiou: bool = False):  # model must be de-paralleled
+    def __init__(self, model, use_mgiou: bool = False, only_mgiou: bool = False):  # model must be de-paralleled
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
         super().__init__(model, use_mgiou=use_mgiou)  # Pass use_mgiou to parent for bbox loss
         self.overlap = model.args.overlap_mask
         self.mgiou_loss = MGIoU2DPlus(reduction="sum", convex_weight=0.1) if use_mgiou else None
         self.use_mgiou = use_mgiou
+        self.only_mgiou = only_mgiou and use_mgiou  # only_mgiou requires use_mgiou to be True
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
-        loss = torch.zeros(4, device=self.device)  # box, seg, cls, dfl
+        loss = torch.zeros(5 if self.use_mgiou else 4, device=self.device)  # box, seg, cls, dfl, [mgiou]
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -659,9 +660,14 @@ class v8SegmentationLoss(v8DetectionLoss):
             if tuple(masks.shape[-2:]) != (mask_h, mask_w):  # downsample
                 masks = F.interpolate(masks[None], (mask_h, mask_w), mode="nearest")[0]
 
-            loss[1] = self.calculate_segmentation_loss(
-                fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
-            )
+            if self.use_mgiou:
+                loss[1], loss[4] = self.calculate_segmentation_loss(
+                    fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
+                )
+            else:
+                loss[1] = self.calculate_segmentation_loss(
+                    fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
+                )
 
         # WARNING: lines below prevent Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
         else:
@@ -671,8 +677,10 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[1] *= self.hyp.box  # seg gain
         loss[2] *= self.hyp.cls  # cls gain
         loss[3] *= self.hyp.dfl  # dfl gain
+        if self.use_mgiou:
+            loss[4] *= self.hyp.box  # mgiou gain (same as seg)
 
-        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl)
+        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, [mgiou])
 
     @staticmethod
     def single_mask_loss(
@@ -760,7 +768,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         pred_masks: torch.Tensor,
         imgsz: torch.Tensor,
         overlap: bool,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate the loss for instance segmentation.
 
@@ -776,7 +784,8 @@ class v8SegmentationLoss(v8DetectionLoss):
             overlap (bool): Whether the masks in `masks` tensor overlap.
 
         Returns:
-            (torch.Tensor): The calculated loss for instance segmentation.
+            (torch.Tensor | tuple[torch.Tensor, torch.Tensor]): If use_mgiou is False, returns the total loss.
+                If use_mgiou is True, returns a tuple of (seg_loss, mgiou_loss).
 
         Notes:
             The batch loss can be computed for improved speed at higher memory usage.
@@ -806,10 +815,11 @@ class v8SegmentationLoss(v8DetectionLoss):
                 else:
                     gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
 
-                # Standard BCE mask loss
-                loss += self.single_mask_loss(
-                    gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
-                )
+                # Standard BCE mask loss (skip if only_mgiou is True)
+                if not self.only_mgiou:
+                    loss += self.single_mask_loss(
+                        gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
+                    )
 
                 # MGIoU polygon loss (if enabled)
                 if self.use_mgiou and self.mgiou_loss is not None:
@@ -823,9 +833,11 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         total_loss = loss / fg_mask.sum()
         
-        # Add MGIoU loss component if enabled
-        if self.use_mgiou and mgiou_loss > 0:
-            total_loss = total_loss + (mgiou_loss / fg_mask.sum())
+        # Return separate losses if MGIoU is enabled
+        if self.use_mgiou:
+            mgiou_loss_normalized = mgiou_loss / fg_mask.sum() if mgiou_loss > 0 else torch.tensor(0.0, device=total_loss.device)
+            # Don't add mgiou_loss to total_loss here, return it separately
+            return total_loss, mgiou_loss_normalized
         
         return total_loss
 

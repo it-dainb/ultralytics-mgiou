@@ -41,6 +41,7 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
         overrides["task"] = "segment"
         super().__init__(cfg, overrides, _callbacks)
         self.use_mgiou = overrides.get("use_mgiou", False)
+        self.only_mgiou = overrides.get("only_mgiou", False)
 
     def get_model(self, cfg: dict | str | None = None, weights: str | Path | None = None, verbose: bool = True):
         """
@@ -59,7 +60,7 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
             >>> model = trainer.get_model(cfg="yolo11n-seg.yaml")
             >>> model = trainer.get_model(weights="yolo11n-seg.pt", verbose=False)
         """
-        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1, use_mgiou=self.use_mgiou)
+        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1, use_mgiou=self.use_mgiou, only_mgiou=self.only_mgiou)
         if weights:
             model.load(weights)
 
@@ -68,6 +69,8 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
     def get_validator(self):
         """Return an instance of SegmentationValidator for validation of YOLO model."""
         self.loss_names = "box_loss", "seg_loss", "cls_loss", "dfl_loss"
+        if self.use_mgiou:
+            self.loss_names += ("mgiou_loss",)
         return yolo.segment.SegmentationValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
