@@ -552,7 +552,7 @@ class SegmentationModel(DetectionModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n-seg.yaml", ch=3, nc=None, verbose=True):
+    def __init__(self, cfg="yolo11n-seg.yaml", ch=3, nc=None, verbose=True, use_mgiou=False):
         """
         Initialize Ultralytics YOLO segmentation model with given config and parameters.
 
@@ -563,10 +563,11 @@ class SegmentationModel(DetectionModel):
             verbose (bool): Whether to display model information.
         """
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        self.use_mgiou = use_mgiou
 
     def init_criterion(self):
         """Initialize the loss criterion for the SegmentationModel."""
-        return v8SegmentationLoss(self)
+        return v8SegmentationLoss(self, use_mgiou=self.use_mgiou)
 
 
 class PoseModel(DetectionModel):

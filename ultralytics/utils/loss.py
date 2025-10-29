@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -227,13 +229,130 @@ class MGIoU2DLoss(nn.Module):
             return loss
         raise ValueError(f"Unsupported reduction: {reduction!r}")
 
+class MGIoU2DPlus(nn.Module):
+    """MGIoU for arbitrary convex quadrangles with an optional convexity loss."""
+
+    def __init__(
+        self,
+        convex_weight: float = 0.0,
+        fast_mode: bool = False,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        if reduction not in {"none", "mean", "sum"}:
+            raise ValueError("reduction must be 'none', 'mean' or 'sum'.")
+        self.convex_weight = convex_weight
+        self.fast_mode = fast_mode
+        self.reduction = reduction
+
+    # ------------------------------------------------------------------ #
+    #                               API                                   #
+    # ------------------------------------------------------------------ #
+    def forward(
+        self,
+        pred: torch.Tensor,                  # [B,N,2] where N≥3
+        target: torch.Tensor,                # [B,N,2] where N≥3
+        visible_mask: torch.Tensor | None = None,
+        reduction_override: str | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute per‐sample MGIoU + convexity, then reduce.
+        
+        Important: pred and target must have the same N (number of corners) within a batch.
+        If polygons have different corner counts, pad to max with repeated last corner before calling.
+        
+        Args:
+            pred: Predicted polygons of shape [B, N, 2] where N≥3
+            target: Target polygons of shape [B, N, 2] where N≥3
+            visible_mask: Optional mask to filter samples
+            reduction_override: Override reduction mode
+            
+        Returns:
+            Loss value (scalar or per-sample depending on reduction)
+        """
+        if visible_mask is not None:
+            mask = visible_mask.bool().squeeze()
+            pred, target = pred[mask], target[mask]
+
+        # per‐sample pure MGIoU
+        losses = (1.0 - torch.vmap(self._mgiou_single)(pred, target)) * 0.5
+
+        # add convex‐penalty if requested
+        if self.convex_weight != 0.0:
+            convex_loss = self._convexity_loss(pred)  # [B]
+            losses = losses + self.convex_weight * convex_loss
+
+        # reduce
+        red = reduction_override or self.reduction
+        return self._reduce(losses, red)
+
+    @staticmethod
+    def _reduce(loss: torch.Tensor, reduction: str) -> torch.Tensor:
+        if reduction == "none":
+            return loss
+        if reduction == "mean":
+            return loss.mean()
+        if reduction == "sum":
+            return loss.sum()
+        raise ValueError(f"Unsupported reduction: {reduction!r}")
+
+    # ------------------------------------------------------------------ #
+    #                       MGIoU internals                              #
+    # ------------------------------------------------------------------ #
+    def _mgiou_single(self, c1: torch.Tensor, c2: torch.Tensor) -> torch.Tensor:
+        axes = torch.cat((self._candidate_axes(c1), self._candidate_axes(c2)))
+        giou1d = []
+        for axis in axes:
+            min1, max1 = (c1 @ axis).min(), (c1 @ axis).max()
+            min2, max2 = (c2 @ axis).min(), (c2 @ axis).max()
+            if self.fast_mode:
+                numerator = torch.minimum(max1, max2) - torch.maximum(min1, min2)
+                denominator = torch.maximum(max1, max2) - torch.minimum(min1, min2)
+                giou1d.append(numerator / denominator)
+            else:
+                # Get intersection, union, and convex hull, then compute MGIoU
+                inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
+                union = (max1 - min1) + (max2 - min2) - inter
+                hull = (torch.maximum(max1, max2) - torch.minimum(min1, min2))
+                giou1d.append(inter / union - (hull - union) / hull)
+        return torch.mean(torch.stack(giou1d))
+
+    @staticmethod
+    def _candidate_axes(corners: torch.Tensor) -> torch.Tensor:
+        center = corners.mean(dim=0, keepdim=True)
+        angles = torch.atan2(corners[:, 1] - center[0, 1], corners[:, 0] - center[0, 0])
+        corners = corners[angles.argsort()]  # clockwise
+        edges = torch.vstack((corners[1:] - corners[:-1], corners[:1] - corners[-1:]))
+        normals = torch.stack((edges[:, 1], -edges[:, 0]), dim=1)
+        return normals
+
+    # ------------------------------------------------------------------ #
+    #                    Convexity consistency penalty                   #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _convexity_loss(polygons: torch.Tensor) -> torch.Tensor:
+        """Mean ε where ε>0 indicates non-convex vertices (0 = perfectly convex)."""
+        B, N, _ = polygons.shape  # N=4 for quadrangles but works for any N≥3
+        v_prev = polygons[:, torch.arange(N) - 1]          # i-1
+        v_curr = polygons
+        v_next = polygons[:, (torch.arange(N) + 1) % N]    # i+1
+
+        edge1 = v_prev - v_curr
+        edge2 = v_next - v_curr
+        cross = edge1[..., 0] * edge2[..., 1] - edge1[..., 1] * edge2[..., 0]  # (B,N)
+
+        sign_ref = torch.where(cross[:, 0:1].abs() <= 0, torch.ones_like(cross[:, 0:1]), cross[:, 0:1]).sign()
+        penalty = torch.clamp(-sign_ref * cross, min=0.0)  # negative => non-convex
+        return penalty.mean(dim=1)  # [B]
+
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
+    def __init__(self, reg_max: int = 16, use_mgiou: bool = False):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.mgiou_loss = MGIoU2DLoss(representation="corner", reduction="sum") if use_mgiou else None
 
     def forward(
         self,
@@ -247,8 +366,20 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        
+        if self.mgiou_loss:
+            # Convert xyxy boxes to 4-corner format for MGIoU
+            pred_corners = self._xyxy_to_corners(pred_bboxes[fg_mask])
+            target_corners = self._xyxy_to_corners(target_bboxes[fg_mask])
+            loss_iou = self.mgiou_loss(
+                pred_corners,
+                target_corners.to(pred_corners.dtype),
+                weight=weight.to(pred_corners.dtype),
+                avg_factor=target_scores_sum
+            )
+        else:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -260,13 +391,32 @@ class BboxLoss(nn.Module):
 
         return loss_iou, loss_dfl
 
+    @staticmethod
+    def _xyxy_to_corners(boxes: torch.Tensor) -> torch.Tensor:
+        """
+        Convert xyxy bounding boxes to 4-corner representation.
+        
+        Args:
+            boxes (torch.Tensor): Boxes in xyxy format, shape (N, 4).
+        
+        Returns:
+            (torch.Tensor): Boxes as 4 corners, shape (N, 4, 2).
+        """
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        corners = torch.stack([
+            torch.stack([x1, y1], dim=-1),  # top-left
+            torch.stack([x2, y1], dim=-1),  # top-right
+            torch.stack([x2, y2], dim=-1),  # bottom-right
+            torch.stack([x1, y2], dim=-1),  # bottom-left
+        ], dim=1)
+        return corners
 
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses for rotated bounding boxes."""
 
     def __init__(self, reg_max: int, use_mgiou: bool = False):
         """Initialize the RotatedBboxLoss module with regularization maximum and DFL settings."""
-        super().__init__(reg_max)
+        super().__init__(reg_max, use_mgiou=False)  # Don't use parent's MGIoU for axis-aligned boxes
         self.mgiou_loss = MGIoU2DLoss(representation="rect", reduction="sum") if use_mgiou else None
 
     def forward(
@@ -303,7 +453,6 @@ class RotatedBboxLoss(BboxLoss):
 
         return loss_iou, loss_dfl
 
-
 class KeypointLoss(nn.Module):
     """Criterion class for computing keypoint losses."""
 
@@ -322,11 +471,10 @@ class KeypointLoss(nn.Module):
         e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)  # from cocoeval
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
-
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
-    def __init__(self, model, tal_topk: int = 10):  # model must be de-paralleled
+    def __init__(self, model, tal_topk: int = 10, use_mgiou: bool = False):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
@@ -343,7 +491,7 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, use_mgiou=use_mgiou).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -433,14 +581,15 @@ class v8DetectionLoss:
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
-
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 
-    def __init__(self, model):  # model must be de-paralleled
+    def __init__(self, model, use_mgiou: bool = False):  # model must be de-paralleled
         """Initialize the v8SegmentationLoss class with model parameters and mask overlap setting."""
-        super().__init__(model)
+        super().__init__(model, use_mgiou=use_mgiou)  # Pass use_mgiou to parent for bbox loss
         self.overlap = model.args.overlap_mask
+        self.mgiou_loss = MGIoU2DPlus(reduction="sum", convex_weight=0.1) if use_mgiou else None
+        self.use_mgiou = use_mgiou
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
@@ -550,6 +699,56 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
         return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).sum()
 
+    @staticmethod
+    def mask_to_polygon_corners(mask: torch.Tensor, epsilon_factor: float = 0.02) -> torch.Tensor | None:
+        """
+        Convert a binary mask to polygon corners using simple contour approximation.
+        
+        Note: MGIoU2DPlus supports any N≥3 corners, so we use a simple one-shot approximation
+        instead of binary search. This is faster and the exact corner count doesn't matter.
+
+        Args:
+            mask (torch.Tensor): Binary mask of shape (H, W).
+            epsilon_factor (float): Approximation accuracy factor (0.01-0.05 typical). 
+                                   Lower = more corners, Higher = fewer corners.
+
+        Returns:
+            (torch.Tensor | None): Polygon corners of shape (N, 2) where N≥3, or None if extraction fails.
+        """
+        try:
+            # Convert to numpy and ensure proper format
+            mask_np = (mask.detach().cpu().numpy() > 0.5).astype('uint8')
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None
+            
+            # Get largest contour by area
+            contour = max(contours, key=cv2.contourArea)
+            
+            # Minimum 3 corners required for MGIoU2DPlus
+            if len(contour) < 3:
+                return None
+            
+            # Simple one-shot polygon approximation
+            arc_len = cv2.arcLength(contour, True)
+            epsilon = epsilon_factor * arc_len
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            # If too few corners, try with convex hull
+            if len(approx) < 3:
+                approx = cv2.convexHull(contour)
+                if len(approx) < 3:
+                    return None
+            
+            # Convert back to torch tensor (shape: [N, 2] where N≥3)
+            corners = torch.from_numpy(approx.reshape(-1, 2)).float().to(mask.device)
+            return corners
+            
+        except (RuntimeError, ValueError, cv2.error):
+            return None
+
     def calculate_segmentation_loss(
         self,
         fg_mask: torch.Tensor,
@@ -586,6 +785,7 @@ class v8SegmentationLoss(v8DetectionLoss):
         """
         _, _, mask_h, mask_w = proto.shape
         loss = 0
+        mgiou_loss = 0
 
         # Normalize to 0-1
         target_bboxes_normalized = target_bboxes / imgsz[[1, 0, 1, 0]]
@@ -606,23 +806,102 @@ class v8SegmentationLoss(v8DetectionLoss):
                 else:
                     gt_mask = masks[batch_idx.view(-1) == i][mask_idx]
 
+                # Standard BCE mask loss
                 loss += self.single_mask_loss(
                     gt_mask, pred_masks_i[fg_mask_i], proto_i, mxyxy_i[fg_mask_i], marea_i[fg_mask_i]
                 )
+
+                # MGIoU polygon loss (if enabled)
+                if self.use_mgiou and self.mgiou_loss is not None:
+                    mgiou_loss += self.compute_mgiou_mask_loss(
+                        gt_mask, pred_masks_i[fg_mask_i], proto_i, fg_mask_i.sum()
+                    )
 
             # WARNING: lines below prevents Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
             else:
                 loss += (proto * 0).sum() + (pred_masks * 0).sum()  # inf sums may lead to nan loss
 
-        return loss / fg_mask.sum()
+        total_loss = loss / fg_mask.sum()
+        
+        # Add MGIoU loss component if enabled
+        if self.use_mgiou and mgiou_loss > 0:
+            total_loss = total_loss + (mgiou_loss / fg_mask.sum())
+        
+        return total_loss
+
+    def compute_mgiou_mask_loss(
+        self,
+        gt_masks: torch.Tensor,
+        pred_coeffs: torch.Tensor,
+        proto: torch.Tensor,
+        num_instances: int,
+    ) -> torch.Tensor:
+        """
+        Compute MGIoU loss for mask polygons.
+        
+        Note: Handles variable corner counts (N≥3) since MGIoU2DPlus supports any polygon size.
+
+        Args:
+            gt_masks (torch.Tensor): Ground truth masks of shape (N, H, W).
+            pred_coeffs (torch.Tensor): Predicted mask coefficients of shape (N, 32).
+            proto (torch.Tensor): Prototype masks of shape (32, H, W).
+            num_instances (int): Number of instances for normalization.
+
+        Returns:
+            (torch.Tensor): MGIoU loss value.
+        """
+        if num_instances == 0:
+            return torch.tensor(0.0, device=gt_masks.device)
+
+        # Generate predicted masks
+        pred_masks = torch.einsum("in,nhw->ihw", pred_coeffs, proto)  # (N, H, W)
+        pred_masks = pred_masks.sigmoid()  # Apply sigmoid to get probabilities
+
+        # Convert masks to polygon corners (variable N≥3)
+        pred_polygons = []
+        gt_polygons = []
+        
+        for pred_mask, gt_mask in zip(pred_masks, gt_masks):
+            # Convert masks to polygons (may have different corner counts)
+            pred_poly = self.mask_to_polygon_corners(pred_mask)
+            gt_poly = self.mask_to_polygon_corners(gt_mask)
+            
+            if pred_poly is not None and gt_poly is not None:
+                # Pad to same size for batching (MGIoU2DPlus requires matching N across batch)
+                # Note: Padding by repeating last corner creates degenerate edges (zero-length),
+                # but these produce zero normals which don't meaningfully affect the loss.
+                max_corners = max(pred_poly.shape[0], gt_poly.shape[0])
+                
+                if pred_poly.shape[0] < max_corners:
+                    # Pad by repeating last corner
+                    pad = pred_poly[-1:].repeat(max_corners - pred_poly.shape[0], 1)
+                    pred_poly = torch.cat([pred_poly, pad], dim=0)
+                
+                if gt_poly.shape[0] < max_corners:
+                    pad = gt_poly[-1:].repeat(max_corners - gt_poly.shape[0], 1)
+                    gt_poly = torch.cat([gt_poly, pad], dim=0)
+                
+                pred_polygons.append(pred_poly)
+                gt_polygons.append(gt_poly)
+
+        # If we have valid polygons, compute MGIoU loss
+        if len(pred_polygons) > 0 and len(gt_polygons) > 0:
+            pred_polygons = torch.stack(pred_polygons)  # (M, max_N, 2)
+            gt_polygons = torch.stack(gt_polygons)      # (M, max_N, 2)
+            
+            # Compute MGIoU loss
+            loss = self.mgiou_loss(pred_polygons, gt_polygons)
+            return loss
+        
+        return torch.tensor(0.0, device=gt_masks.device)
 
 
 class v8PoseLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 pose estimation."""
 
-    def __init__(self, model):  # model must be de-paralleled
+    def __init__(self, model, use_mgiou: bool = False):  # model must be de-paralleled
         """Initialize v8PoseLoss with model parameters and keypoint-specific loss functions."""
-        super().__init__(model)
+        super().__init__(model, use_mgiou=use_mgiou)
         self.kpt_shape = model.model[-1].kpt_shape
         self.bce_pose = nn.BCEWithLogitsLoss()
         is_pose = self.kpt_shape == [17, 3]
@@ -911,10 +1190,10 @@ class v8OBBLoss(v8DetectionLoss):
 class E2EDetectLoss:
     """Criterion class for computing training losses for end-to-end detection."""
 
-    def __init__(self, model):
+    def __init__(self, model, use_mgiou: bool = False):
         """Initialize E2EDetectLoss with one-to-many and one-to-one detection losses using the provided model."""
-        self.one2many = v8DetectionLoss(model, tal_topk=10)
-        self.one2one = v8DetectionLoss(model, tal_topk=1)
+        self.one2many = v8DetectionLoss(model, tal_topk=10, use_mgiou=use_mgiou)
+        self.one2one = v8DetectionLoss(model, tal_topk=1, use_mgiou=use_mgiou)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
@@ -929,9 +1208,9 @@ class E2EDetectLoss:
 class TVPDetectLoss:
     """Criterion class for computing training losses for text-visual prompt detection."""
 
-    def __init__(self, model):
+    def __init__(self, model, use_mgiou: bool = False):
         """Initialize TVPDetectLoss with task-prompt and visual-prompt criteria using the provided model."""
-        self.vp_criterion = v8DetectionLoss(model)
+        self.vp_criterion = v8DetectionLoss(model, use_mgiou=use_mgiou)
         # NOTE: store following info as it's changeable in __call__
         self.ori_nc = self.vp_criterion.nc
         self.ori_no = self.vp_criterion.no
@@ -968,10 +1247,10 @@ class TVPDetectLoss:
 class TVPSegmentLoss(TVPDetectLoss):
     """Criterion class for computing training losses for text-visual prompt segmentation."""
 
-    def __init__(self, model):
+    def __init__(self, model, use_mgiou: bool = False):
         """Initialize TVPSegmentLoss with task-prompt and visual-prompt criteria using the provided model."""
-        super().__init__(model)
-        self.vp_criterion = v8SegmentationLoss(model)
+        super().__init__(model, use_mgiou=use_mgiou)
+        self.vp_criterion = v8SegmentationLoss(model, use_mgiou=use_mgiou)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the loss for text-visual prompt segmentation."""

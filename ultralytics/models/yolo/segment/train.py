@@ -40,6 +40,7 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
             overrides = {}
         overrides["task"] = "segment"
         super().__init__(cfg, overrides, _callbacks)
+        self.use_mgiou = overrides.get("use_mgiou", False)
 
     def get_model(self, cfg: dict | str | None = None, weights: str | Path | None = None, verbose: bool = True):
         """
@@ -58,7 +59,7 @@ class SegmentationTrainer(yolo.detect.DetectionTrainer):
             >>> model = trainer.get_model(cfg="yolo11n-seg.yaml")
             >>> model = trainer.get_model(weights="yolo11n-seg.pt", verbose=False)
         """
-        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        model = SegmentationModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1, use_mgiou=self.use_mgiou)
         if weights:
             model.load(weights)
 
