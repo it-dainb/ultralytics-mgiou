@@ -2107,6 +2107,7 @@ class Format:
         return_mask: bool = False,
         return_keypoint: bool = False,
         return_obb: bool = False,
+        return_polygon: bool = False,
         mask_ratio: int = 4,
         mask_overlap: bool = True,
         batch_idx: bool = True,
@@ -2150,6 +2151,7 @@ class Format:
         self.return_mask = return_mask  # set False when training detection only
         self.return_keypoint = return_keypoint
         self.return_obb = return_obb
+        self.return_polygon = return_polygon
         self.mask_ratio = mask_ratio
         self.mask_overlap = mask_overlap
         self.batch_idx = batch_idx  # keep the batch indexes
@@ -2215,10 +2217,17 @@ class Format:
             labels["bboxes"] = (
                 xyxyxyxy2xywhr(torch.from_numpy(instances.segments)) if len(instances.segments) else torch.zeros((0, 5))
             )
+        if self.return_polygon:
+            labels["polygons"] = (
+                torch.from_numpy(instances.segments) if len(instances.segments) else torch.zeros((0, 4, 2))
+            )
         # NOTE: need to normalize obb in xywhr format for width-height consistency
         if self.normalize:
             labels["bboxes"][:, [0, 2]] /= w
             labels["bboxes"][:, [1, 3]] /= h
+            if self.return_polygon and "polygons" in labels:
+                labels["polygons"][..., 0] /= w
+                labels["polygons"][..., 1] /= h
         # Then we can use collate_fn
         if self.batch_idx:
             labels["batch_idx"] = torch.zeros(nl)

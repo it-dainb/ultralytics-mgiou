@@ -85,6 +85,7 @@ class YOLODataset(BaseDataset):
         self.use_segments = task == "segment"
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
+        self.use_polygon = task == "polygon"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
@@ -231,6 +232,7 @@ class YOLODataset(BaseDataset):
                 return_mask=self.use_segments,
                 return_keypoint=self.use_keypoints,
                 return_obb=self.use_obb,
+                return_polygon=self.use_polygon,
                 batch_idx=True,
                 mask_ratio=hyp.mask_ratio,
                 mask_overlap=hyp.overlap_mask,
@@ -272,16 +274,38 @@ class YOLODataset(BaseDataset):
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
 
-        # NOTE: do NOT resample oriented boxes
-        segment_resamples = 100 if self.use_obb else 1000
-        if len(segments) > 0:
-            # make sure segments interpolate correctly if original length is greater than segment_resamples
-            max_len = max(len(s) for s in segments)
-            segment_resamples = (max_len + 1) if segment_resamples < max_len else segment_resamples
-            # list[np.array(segment_resamples, 2)] * num_samples
-            segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
+        # For polygon task, store raw segments as polygons without resampling
+        if self.use_polygon:
+            if len(segments) > 0:
+                # Store polygons as fixed-size arrays (np points)
+                np_points = self.data.get("np", 4)  # default to 4 points if not specified
+                polygons = []
+                for seg in segments:
+                    if len(seg) >= np_points:
+                        # Take first np_points
+                        polygons.append(seg[:np_points])
+                    else:
+                        # Pad with zeros if not enough points
+                        padded = np.zeros((np_points, 2), dtype=np.float32)
+                        padded[:len(seg)] = seg
+                        polygons.append(padded)
+                label["polygons"] = np.stack(polygons, axis=0)
+            else:
+                label["polygons"] = np.zeros((0, self.data.get("np", 4), 2), dtype=np.float32)
+            # Still keep segments for bbox calculation
+            segments = np.zeros((len(segments), 1, 2), dtype=np.float32) if len(segments) > 0 else np.zeros((0, 1, 2), dtype=np.float32)
         else:
-            segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+            # NOTE: do NOT resample oriented boxes
+            segment_resamples = 100 if self.use_obb else 1000
+            if len(segments) > 0:
+                # make sure segments interpolate correctly if original length is greater than segment_resamples
+                max_len = max(len(s) for s in segments)
+                segment_resamples = (max_len + 1) if segment_resamples < max_len else segment_resamples
+                # list[np.array(segment_resamples, 2)] * num_samples
+                segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
+            else:
+                segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+        
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
         return label
 
@@ -306,7 +330,7 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb", "polygons"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])
