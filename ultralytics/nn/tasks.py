@@ -652,8 +652,8 @@ class PolygonModel(DetectionModel):
         """
         if not isinstance(cfg, dict):
             cfg = yaml_model_load(cfg)  # load model YAML
-        if any(data_np) and int(data_np) != int(cfg["np"]):
-            LOGGER.info(f"Overriding model.yaml np={cfg['np']} with np={data_np}")
+        if data_np and int(data_np) != int(cfg.get("np", 0)):
+            LOGGER.info(f"Overriding model.yaml np={cfg.get('np')} with np={data_np}")
             cfg["np"] = data_np
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.use_mgiou = use_mgiou
