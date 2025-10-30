@@ -370,10 +370,20 @@ class MGIoUPoly(nn.Module):
             # Sort vertices by angle to ensure consistent ordering
             pred_sorted = self._sort_vertices(pred_valid)
             target_sorted = self._sort_vertices(target_valid)
+            
+            # Debug check for sorted vertices
+            if _DEBUG_NAN:
+                _check_nan_tensor(pred_sorted, "pred_sorted", "MGIoUPoly.forward after sorting")
+                _check_nan_tensor(target_sorted, "target_sorted", "MGIoUPoly.forward after sorting")
 
             # Get axes and validity masks (detects degenerate edges from padding)
             axes1, mask1 = self._axes_with_mask(pred_sorted)
             axes2, mask2 = self._axes_with_mask(target_sorted)
+            
+            # Debug check for axes
+            if _DEBUG_NAN:
+                _check_nan_tensor(axes1, "axes1", "MGIoUPoly.forward axes computation")
+                _check_nan_tensor(axes2, "axes2", "MGIoUPoly.forward axes computation")
             
             axes = torch.cat((axes1, axes2), dim=1)  # [B_valid, N+M, 2]
             mask = torch.cat((mask1, mask2), dim=1)  # [B_valid, N+M] - True = valid, False = degenerate
@@ -385,19 +395,43 @@ class MGIoUPoly(nn.Module):
             max1, _ = proj1.max(dim=1)
             min2, _ = proj2.min(dim=1)
             max2, _ = proj2.max(dim=1)
+            
+            # Debug check for projections
+            if _DEBUG_NAN:
+                _check_nan_tensor(proj1, "proj1", "MGIoUPoly.forward projection")
+                _check_nan_tensor(proj2, "proj2", "MGIoUPoly.forward projection")
+                _check_nan_tensor(min1, "min1", "MGIoUPoly.forward projection")
+                _check_nan_tensor(max1, "max1", "MGIoUPoly.forward projection")
+                _check_nan_tensor(min2, "min2", "MGIoUPoly.forward projection")
+                _check_nan_tensor(max2, "max2", "MGIoUPoly.forward projection")
 
             # Compute GIoU on each axis
             # Note: _EPS prevents division by zero in edge cases
             inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
             hull  = torch.maximum(max1, max2) - torch.minimum(min1, min2)
+            
+            # Safety: Clamp hull to prevent division by very small values
+            # Hull near zero indicates degenerate/collapsed polygons on this axis
+            hull_safe = hull.clamp(min=_EPS)
 
             if self.fast_mode:
                 # Simplified GIoU: intersection / hull
-                giou1d = inter / (hull + _EPS)
+                giou1d = inter / hull_safe
             else:
                 # Match reference formula exactly: inter/union - (hull-union)/hull
                 union = (max1 - min1) + (max2 - min2) - inter
-                giou1d = inter / (union + _EPS) - (hull - union) / (hull + _EPS)
+                
+                # Safety: Clamp union to prevent negative or very small values
+                union_safe = union.clamp(min=_EPS)
+                
+                # Compute GIoU components safely
+                iou_term = inter / union_safe
+                penalty_term = (hull_safe - union_safe) / hull_safe
+                giou1d = iou_term - penalty_term
+                
+                # Additional safety: Clamp GIoU to valid range [-1, 1]
+                # GIoU should theoretically be in [-1, 1], but numerical issues can push it outside
+                giou1d = giou1d.clamp(min=-1.0, max=1.0)
 
             # *** KEY: Masked mean - only average over valid (non-degenerate) axes ***
             # This allows correct batching of polygons with different vertex counts!
@@ -447,21 +481,26 @@ class MGIoUPoly(nn.Module):
         Compute edge normals and validity mask.
         
         Returns:
-            normals: [B, N, 2] - edge normal vectors
+            normals: [B, N, 2] - edge normal vectors (normalized)
             mask: [B, N] - True if edge is valid (length > eps), False if degenerate
         
         This automatically detects padding artifacts (repeated vertices) and excludes
         their axes from the mean calculation, enabling correct mixed-vertex batching.
         """
         edges = poly.roll(-1, dims=1) - poly  # [B, N, 2]
-        edge_lengths = torch.norm(edges, dim=-1)  # [B, N]
+        edge_lengths = torch.norm(edges, dim=-1, keepdim=True)  # [B, N, 1]
         
         # Mark edges as valid if length > eps
         # Degenerate edges (from padding) will have length ≈ 0
-        mask = edge_lengths > self.eps  # [B, N]
+        mask = (edge_lengths.squeeze(-1) > self.eps)  # [B, N]
         
         # Compute normals using (dy, -dx) convention to match MGIoU2DPlus
         normals = torch.stack((edges[..., 1], -edges[..., 0]), dim=-1).to(edges.dtype)
+        
+        # Normalize normals to prevent extreme projection values
+        # Use safe division: only normalize valid edges, leave degenerate ones as-is (will be masked out)
+        normals = normals / (edge_lengths + _EPS)
+        
         return normals, mask
     
     @staticmethod
