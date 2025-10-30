@@ -497,7 +497,13 @@ class MGIoUPoly(nn.Module):
             # Adaptive convex normalization
             if self.adaptive_convex_pow:
                 with torch.no_grad():
+                    # Get device from input tensors
+                    device = target_valid.device
+                    
+                    # Update EMA on the correct device
                     m = mgiou.mean().detach()
+                    self._mgiou_ema = self._mgiou_ema.to(device)
+                    self._prev_pow = self._prev_pow.to(device)
                     self._mgiou_ema.mul_(self.ema_momentum).add_((1 - self.ema_momentum) * m)
                     
                     alpha = torch.sigmoid(self.k * (self._mgiou_ema - self.thresh))
