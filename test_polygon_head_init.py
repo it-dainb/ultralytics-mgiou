@@ -43,15 +43,19 @@ def test_polygon_head_bias_init():
         print(f"Layer {i}: min={bias.min().item():.6f}, max={bias.max().item():.6f}, mean={bias.mean().item():.6f}")
         assert torch.allclose(bias, torch.ones_like(bias)), f"Layer {i}: cv2 bias should be 1.0"
     
-    # Check that cv4 (polygon head) biases are set to 0.0
+    # Check that cv4 (polygon head) uses PyTorch default initialization (finite, small values)
     print("\n=== Checking polygon head (cv4) bias initialization ===")
     for i, conv in enumerate(head.cv4):
         final_conv = conv[-1]
         bias = final_conv.bias.data
         weight = final_conv.weight.data
-        print(f"Layer {i}: bias={bias.abs().max().item():.6f}, weight={weight.abs().max().item():.6f}")
-        assert torch.allclose(bias, torch.zeros_like(bias)), f"Layer {i}: cv4 bias should be 0.0"
-        assert torch.allclose(weight, torch.zeros_like(weight)), f"Layer {i}: cv4 weight should be 0.0"
+        print(f"Layer {i}: bias_range=[{bias.min().item():.6f}, {bias.max().item():.6f}], weight_range=[{weight.min().item():.6f}, {weight.max().item():.6f}]")
+        # PyTorch default initialization should produce finite, reasonably small values
+        assert torch.isfinite(bias).all(), f"Layer {i}: cv4 bias contains NaN/Inf!"
+        assert torch.isfinite(weight).all(), f"Layer {i}: cv4 weight contains NaN/Inf!"
+        # Default initialization should be in reasonable range (typically |x| < 1 for small networks)
+        assert bias.abs().max() < 10.0, f"Layer {i}: cv4 bias too large"
+        assert weight.abs().max() < 10.0, f"Layer {i}: cv4 weight too large"
     
     print("\n✅ All bias initializations are correct!")
     

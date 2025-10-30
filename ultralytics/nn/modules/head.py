@@ -450,16 +450,6 @@ class Polygon(Detect):
 
         c4 = max(ch[0] // 4, self.npoly)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.npoly, 1)) for x in ch)
-        # Don't call bias_init() here - it will be called after stride is computed in tasks.py
-
-    def bias_init(self):
-        """Initialize Detect() biases (cv2, cv3) and Polygon head (cv4) biases."""
-        # First initialize parent Detect head (cv2=box, cv3=classification)
-        super().bias_init()
-        # Then initialize polygon head (cv4) to safe values
-        for m in self.cv4:
-            nn.init.constant_(m[-1].weight, 0.0)
-            nn.init.constant_(m[-1].bias, 0.0)
 
     def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
         """Perform forward pass through YOLO model and return predictions."""
