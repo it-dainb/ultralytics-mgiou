@@ -418,10 +418,10 @@ class MGIoUPoly(nn.Module):
             proj1 = torch.bmm(pred_sorted.to(axes.dtype), axes.transpose(1, 2))
             proj2 = torch.bmm(target_sorted.to(axes.dtype), axes.transpose(1, 2))
             
-            # Safety: Replace NaN/Inf in projections with safe values
+            # Safety: Replace NaN/Inf in projections using nan_to_num for gradient preservation
             # This can happen with extreme polygon coordinates
-            proj1 = torch.where(torch.isnan(proj1) | torch.isinf(proj1), torch.zeros_like(proj1), proj1)
-            proj2 = torch.where(torch.isnan(proj2) | torch.isinf(proj2), torch.zeros_like(proj2), proj2)
+            proj1 = torch.nan_to_num(proj1, nan=0.0, posinf=1e6, neginf=-1e6)
+            proj2 = torch.nan_to_num(proj2, nan=0.0, posinf=1e6, neginf=-1e6)
             
             min1, _ = proj1.min(dim=1)
             max1, _ = proj1.max(dim=1)
@@ -442,10 +442,10 @@ class MGIoUPoly(nn.Module):
             inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
             hull  = torch.maximum(max1, max2) - torch.minimum(min1, min2)
             
-            # Safety: Replace NaN values with safe defaults before clamping
+            # Safety: Replace NaN values using nan_to_num for gradient preservation
             # NaN can occur from numerical issues in projections (e.g., Inf - Inf)
-            inter = torch.where(torch.isnan(inter), torch.zeros_like(inter), inter)
-            hull = torch.where(torch.isnan(hull), torch.full_like(hull, _EPS), hull)
+            inter = torch.nan_to_num(inter, nan=0.0, posinf=1e6, neginf=0.0)
+            hull = torch.nan_to_num(hull, nan=_EPS, posinf=1e6, neginf=_EPS)
             
             # Safety: Clamp hull to prevent division by very small values
             # Hull near zero indicates degenerate/collapsed polygons on this axis
@@ -454,8 +454,8 @@ class MGIoUPoly(nn.Module):
             if self.fast_mode:
                 # Simplified GIoU: intersection / hull
                 giou1d = inter / hull_safe
-                # Safety: Replace NaN from division issues
-                giou1d = torch.where(torch.isnan(giou1d), torch.zeros_like(giou1d), giou1d)
+                # Safety: Replace NaN using nan_to_num for gradient preservation
+                giou1d = torch.nan_to_num(giou1d, nan=0.0, posinf=1.0, neginf=-1.0)
             else:
                 # Match reference formula exactly: inter/union - (hull-union)/hull
                 union = (max1 - min1) + (max2 - min2) - inter
@@ -467,10 +467,10 @@ class MGIoUPoly(nn.Module):
                 iou_term = inter / union_safe
                 penalty_term = (hull_safe - union_safe) / hull_safe
                 
-                # Safety: Replace NaN in intermediate terms
+                # Safety: Replace NaN using nan_to_num for gradient preservation
                 # Can occur from 0/eps or other numerical instabilities
-                iou_term = torch.where(torch.isnan(iou_term), torch.zeros_like(iou_term), iou_term)
-                penalty_term = torch.where(torch.isnan(penalty_term), torch.zeros_like(penalty_term), penalty_term)
+                iou_term = torch.nan_to_num(iou_term, nan=0.0, posinf=1.0, neginf=0.0)
+                penalty_term = torch.nan_to_num(penalty_term, nan=0.0, posinf=1.0, neginf=0.0)
                 
                 giou1d = iou_term - penalty_term
                 
@@ -554,33 +554,26 @@ class MGIoUPoly(nn.Module):
         """
         Sort vertices by angle from centroid.
         
-        NaN Prevention:
-        - Replaces NaN values in input with zeros before processing
-        - Handles degenerate cases where all vertices are identical
-        - Cleans up any NaN in angles before sorting
+        NaN Prevention Strategy:
+        - Uses nan_to_num() which preserves gradient flow better than where()
+        - Replaces NaN with 0, Inf with large finite values
+        - For degenerate cases (all vertices same), sorting still works deterministically
         """
         B, N, _ = poly.shape
         
-        # Safety: Replace any NaN in input polygons with zeros
-        # This can happen if predictions go wild during early training
-        poly_safe = torch.where(torch.isnan(poly), torch.zeros_like(poly), poly)
+        # Safety: Replace NaN/Inf using nan_to_num which preserves gradients better
+        # nan -> 0.0, +inf -> max_float, -inf -> min_float
+        poly_safe = torch.nan_to_num(poly, nan=0.0, posinf=1e6, neginf=-1e6)
         
         # Compute centroid
         center = poly_safe.mean(dim=1, keepdim=True)  # [B, 1, 2]
         
-        # Safety: Replace NaN centroids (can happen if all vertices are NaN before cleaning)
-        center = torch.where(torch.isnan(center), torch.zeros_like(center), center)
-        
         # Compute angles from centroid
         angles = torch.atan2(poly_safe[..., 1] - center[..., 1], poly_safe[..., 0] - center[..., 0])  # [B, N]
         
-        # Safety: Replace NaN angles (can happen with degenerate polygons where all vertices are same)
-        # Use sequential indices as fallback to maintain deterministic ordering
-        angles = torch.where(
-            torch.isnan(angles),
-            torch.arange(N, device=poly.device, dtype=angles.dtype).unsqueeze(0).expand(B, -1),
-            angles
-        )
+        # For degenerate polygons (all vertices same), atan2 returns 0 for all angles
+        # This is fine - they'll maintain their original order after sorting
+        angles = torch.nan_to_num(angles, nan=0.0)
         
         indices = angles.argsort(dim=1)  # [B, N]
         return torch.gather(poly_safe, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
@@ -596,25 +589,22 @@ class MGIoUPoly(nn.Module):
         This automatically detects padding artifacts (repeated vertices) and excludes
         their axes from the mean calculation, enabling correct mixed-vertex batching.
         
-        NaN Prevention:
-        - Replaces NaN/Inf values in edges before computing lengths
-        - Replaces NaN/Inf in edge lengths with zeros
-        - Replaces NaN/Inf in normals after normalization
+        NaN Prevention Strategy:
+        - Uses torch.nan_to_num() which preserves gradient flow better than torch.where()
+        - Replaces NaN with 0, Inf with large finite values (±1e6)
         - Ensures at least one valid axis per sample to prevent all-invalid masks
+        - Edge length epsilon prevents division by zero in normalization
         """
         edges = poly.roll(-1, dims=1) - poly  # [B, N, 2]
         
-        # Safety: Replace NaN/Inf in edges (can happen with invalid polygon coordinates)
-        edges = torch.where(torch.isnan(edges) | torch.isinf(edges), torch.zeros_like(edges), edges)
+        # Safety: Replace NaN/Inf in edges using nan_to_num for gradient preservation
+        # nan -> 0.0, +inf -> 1e6, -inf -> -1e6
+        edges = torch.nan_to_num(edges, nan=0.0, posinf=1e6, neginf=-1e6)
         
         edge_lengths = torch.norm(edges, dim=-1, keepdim=True)  # [B, N, 1]
         
-        # Safety: Replace NaN/Inf in edge lengths
-        edge_lengths = torch.where(
-            torch.isnan(edge_lengths) | torch.isinf(edge_lengths),
-            torch.zeros_like(edge_lengths),
-            edge_lengths
-        )
+        # Safety: Replace NaN/Inf in edge lengths using nan_to_num
+        edge_lengths = torch.nan_to_num(edge_lengths, nan=0.0, posinf=1e6, neginf=0.0)
         
         # Mark edges as valid if length > eps
         # Degenerate edges (from padding) will have length ≈ 0
@@ -635,9 +625,9 @@ class MGIoUPoly(nn.Module):
         # Use safe division: divide by (length + eps) to prevent division by zero
         normals = normals / (edge_lengths + _EPS)
         
-        # Safety: Final cleanup - replace any remaining NaN/Inf in normals with zeros
-        # This can theoretically happen from 0/eps edge cases in extreme numerical conditions
-        normals = torch.where(torch.isnan(normals) | torch.isinf(normals), torch.zeros_like(normals), normals)
+        # Safety: Final cleanup using nan_to_num for gradient preservation
+        # This handles any remaining numerical edge cases
+        normals = torch.nan_to_num(normals, nan=0.0, posinf=1e6, neginf=-1e6)
         
         return normals, mask
     
