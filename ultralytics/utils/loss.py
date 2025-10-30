@@ -1182,6 +1182,12 @@ class v8PoseLoss(v8DetectionLoss):
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
         pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
+        
+        # Critical NaN check: Detect NaN in model outputs BEFORE any processing
+        # If NaN detected, this indicates upstream training instability (gradient explosion, bad weights, etc.)
+        _check_nan_tensor(pred_scores, "pred_scores", "v8PoseLoss.__call__ after permute")
+        _check_nan_tensor(pred_distri, "pred_distri", "v8PoseLoss.__call__ after permute")
+        _check_nan_tensor(pred_kpts, "pred_kpts (raw)", "v8PoseLoss.__call__ after permute")
 
         dtype = pred_scores.dtype
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
@@ -1196,6 +1202,9 @@ class v8PoseLoss(v8DetectionLoss):
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
         pred_kpts = self.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.kpt_shape))
+        
+        # Check for NaN after decoding - helps identify if NaN comes from decode operation
+        _check_nan_tensor(pred_kpts, "pred_kpts (decoded)", "v8PoseLoss.__call__ after kpts_decode")
 
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
@@ -1337,6 +1346,12 @@ class v8PolygonLoss(v8DetectionLoss):
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
         pred_poly = pred_poly.permute(0, 2, 1).contiguous()
+        
+        # Critical NaN check: Detect NaN in model outputs BEFORE any processing
+        # If NaN detected, this indicates upstream training instability (gradient explosion, bad weights, etc.)
+        _check_nan_tensor(pred_scores, "pred_scores", "v8PolygonLoss.__call__ after permute")
+        _check_nan_tensor(pred_distri, "pred_distri", "v8PolygonLoss.__call__ after permute")
+        _check_nan_tensor(pred_poly, "pred_poly (raw)", "v8PolygonLoss.__call__ after permute")
 
         dtype = pred_scores.dtype
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
@@ -1351,6 +1366,9 @@ class v8PolygonLoss(v8DetectionLoss):
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
         pred_poly = self.poly_decode(anchor_points, pred_poly.view(batch_size, -1, *self.poly_shape))
+        
+        # Check for NaN after decoding - helps identify if NaN comes from decode operation
+        _check_nan_tensor(pred_poly, "pred_poly (decoded)", "v8PolygonLoss.__call__ after poly_decode")
 
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
@@ -1465,8 +1483,8 @@ class v8PolygonLoss(v8DetectionLoss):
                         if grad is not None:
                             grad_norm = grad.norm().item()
                             grad_mean = grad.abs().mean().item()
-                            print(f"[GRADIENT] Image {i}: norm={grad_norm:.6e}, mean_abs={grad_mean:.6e}")
                             if grad_norm < 1e-8:
+                                print(f"[GRADIENT] Image {i}: norm={grad_norm:.6e}, mean_abs={grad_mean:.6e}")
                                 print(f"  WARNING: Very small gradient detected! Loss may not be learning.")
                         return grad
                     poly_loss.register_hook(log_gradient)
