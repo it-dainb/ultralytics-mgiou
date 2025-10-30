@@ -551,12 +551,39 @@ class MGIoUPoly(nn.Module):
 
     @staticmethod
     def _sort_vertices(poly):
-        """Sort vertices by angle from centroid (like MGIoU2DPlus._candidate_axes)."""
+        """
+        Sort vertices by angle from centroid.
+        
+        NaN Prevention:
+        - Replaces NaN values in input with zeros before processing
+        - Handles degenerate cases where all vertices are identical
+        - Cleans up any NaN in angles before sorting
+        """
         B, N, _ = poly.shape
-        center = poly.mean(dim=1, keepdim=True)  # [B, 1, 2]
-        angles = torch.atan2(poly[..., 1] - center[..., 1], poly[..., 0] - center[..., 0])  # [B, N]
+        
+        # Safety: Replace any NaN in input polygons with zeros
+        # This can happen if predictions go wild during early training
+        poly_safe = torch.where(torch.isnan(poly), torch.zeros_like(poly), poly)
+        
+        # Compute centroid
+        center = poly_safe.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        
+        # Safety: Replace NaN centroids (can happen if all vertices are NaN before cleaning)
+        center = torch.where(torch.isnan(center), torch.zeros_like(center), center)
+        
+        # Compute angles from centroid
+        angles = torch.atan2(poly_safe[..., 1] - center[..., 1], poly_safe[..., 0] - center[..., 0])  # [B, N]
+        
+        # Safety: Replace NaN angles (can happen with degenerate polygons where all vertices are same)
+        # Use sequential indices as fallback to maintain deterministic ordering
+        angles = torch.where(
+            torch.isnan(angles),
+            torch.arange(N, device=poly.device, dtype=angles.dtype).unsqueeze(0).expand(B, -1),
+            angles
+        )
+        
         indices = angles.argsort(dim=1)  # [B, N]
-        return torch.gather(poly, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
+        return torch.gather(poly_safe, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
 
     def _axes_with_mask(self, poly):
         """
@@ -568,20 +595,49 @@ class MGIoUPoly(nn.Module):
         
         This automatically detects padding artifacts (repeated vertices) and excludes
         their axes from the mean calculation, enabling correct mixed-vertex batching.
+        
+        NaN Prevention:
+        - Replaces NaN/Inf values in edges before computing lengths
+        - Replaces NaN/Inf in edge lengths with zeros
+        - Replaces NaN/Inf in normals after normalization
+        - Ensures at least one valid axis per sample to prevent all-invalid masks
         """
         edges = poly.roll(-1, dims=1) - poly  # [B, N, 2]
+        
+        # Safety: Replace NaN/Inf in edges (can happen with invalid polygon coordinates)
+        edges = torch.where(torch.isnan(edges) | torch.isinf(edges), torch.zeros_like(edges), edges)
+        
         edge_lengths = torch.norm(edges, dim=-1, keepdim=True)  # [B, N, 1]
+        
+        # Safety: Replace NaN/Inf in edge lengths
+        edge_lengths = torch.where(
+            torch.isnan(edge_lengths) | torch.isinf(edge_lengths),
+            torch.zeros_like(edge_lengths),
+            edge_lengths
+        )
         
         # Mark edges as valid if length > eps
         # Degenerate edges (from padding) will have length ≈ 0
         mask = (edge_lengths.squeeze(-1) > self.eps)  # [B, N]
         
+        # Safety: Ensure at least one valid axis per sample
+        # If all edges are degenerate, mark first edge as valid to prevent division by zero
+        all_invalid = ~mask.any(dim=1)  # [B]
+        if all_invalid.any():
+            mask[all_invalid, 0] = True
+            # Give the first edge a small non-zero length to prevent NaN in normalization
+            edge_lengths[all_invalid, 0, :] = _EPS
+        
         # Compute normals using (dy, -dx) convention to match MGIoU2DPlus
         normals = torch.stack((edges[..., 1], -edges[..., 0]), dim=-1).to(edges.dtype)
         
         # Normalize normals to prevent extreme projection values
-        # Use safe division: only normalize valid edges, leave degenerate ones as-is (will be masked out)
+        # Use safe division: divide by (length + eps) to prevent division by zero
         normals = normals / (edge_lengths + _EPS)
+        
+        # Safety: Final cleanup - replace any remaining NaN/Inf in normals with zeros
+        # This can theoretically happen from 0/eps edge cases in extreme numerical conditions
+        normals = torch.where(torch.isnan(normals) | torch.isinf(normals), torch.zeros_like(normals), normals)
         
         return normals, mask
     
