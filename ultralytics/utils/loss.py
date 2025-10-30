@@ -1331,10 +1331,23 @@ class v8PolygonLoss(v8DetectionLoss):
 
     @staticmethod
     def poly_decode(anchor_points: torch.Tensor, pred_poly: torch.Tensor) -> torch.Tensor:
+        """
+        Decode polygon predictions from anchor-based offsets to absolute coordinates.
+        
+        Args:
+            anchor_points: Tensor of shape [num_anchors, 2] with (x, y) anchor positions
+            pred_poly: Tensor of shape [batch, num_anchors, num_points, 2] with predicted offsets
+            
+        Returns:
+            Decoded polygon coordinates of shape [batch, num_anchors, num_points, 2]
+        """
         y = pred_poly.clone()
-        y[..., :2] *= 2.0
-        y[..., 0] += anchor_points[:, [0]] - 0.5
-        y[..., 1] += anchor_points[:, [1]] - 0.5
+        # Reshape anchor_points for broadcasting: [1, num_anchors, 1, 2]
+        anchor_broadcast = anchor_points.unsqueeze(0).unsqueeze(2)
+        
+        # Scale predictions by 2 and add anchor offset
+        y = y * 2.0 + anchor_broadcast - 0.5
+        
         return y
 
     def calculate_polygon_loss(
