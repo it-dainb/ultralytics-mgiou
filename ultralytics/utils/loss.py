@@ -1381,11 +1381,10 @@ class v8PolygonLoss(v8DetectionLoss):
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Use mean instead of sum/target_scores_sum to prevent extremely high classification loss
-        # Original: sum(BCE) / num_positives where num_positives << num_anchors creates loss ~650-710
-        # This causes classification gradients to dominate by 11,600x over polygon gradients
-        # New: mean(BCE) gives comparable loss magnitude to other components
-        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).mean()
+        # Classification loss: use sum/target_scores_sum normalization (standard YOLO approach)
+        # This normalizes by the number of positive samples, ensuring proper gradient flow
+        # The loss magnitude is controlled by self.hyp.cls weight in the final loss computation
+        loss[2] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         if fg_mask.sum():
             target_bboxes /= stride_tensor
