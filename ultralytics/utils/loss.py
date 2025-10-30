@@ -16,7 +16,7 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
-_EPS = 1e-9
+_EPS = 1e-6
 
 # Global flag for NaN debugging - can be enabled via environment variable or code
 # Set ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks
@@ -319,47 +319,113 @@ class MGIoURect(nn.Module):
 
 class MGIoUPoly(nn.Module):
     """
-    MGIoU loss for general polygons with automatic degenerate edge detection.
+    Hybrid MGIoU loss with adaptive convex normalization (MGIoU2DPlusHybrid).
     
-    Supports:
-    - Mixed vertex counts in batches (e.g., triangles, quads, hexagons together)
-    - Automatic padding artifact detection and removal
-    - Weighted loss computation
-    - Flexible reduction strategies
+    Combines:
+      1. True polygonal MGIoU (multi-axis projection overlap)
+      2. Optional convexity penalty normalized by polygon scale
+      3. Safe numerical clipping and tanh saturation
+      4. Automatic, robust adaptation of convex normalization exponent
+    
+    Key Features:
+    - Adaptive convex normalization exponent based on training progress (MGIoU EMA)
+    - Scale-robust normalization using percentile-based edge length ratios
+    - Gradient-preserving numerical safety mechanisms
+    - Fixed number of vertices per polygon (as specified by polygon head)
     
     NaN Prevention Mechanisms:
     - Degenerate targets (all zeros) automatically fall back to L1 loss
-    - Degenerate edges (repeated vertices from padding) are detected and masked out
-    - Division operations use epsilon (_EPS = 1e-9) to prevent division by zero
-    - Masked mean computation only averages over valid axes (non-degenerate edges)
-    - Edge length detection filters out padding artifacts (edges < eps)
+    - Division operations use epsilon to prevent division by zero
     - All clamp operations use safe minimum values
+    - Safe tanh saturation prevents extreme MGIoU ratios
     
     Debugging:
     - Set environment variable ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN/Inf checks
-    - Debug mode adds validation at critical points: inputs, GIoU computation, weighting, output
-    - Raises RuntimeError with detailed diagnostics if NaN/Inf detected
+    - Debug mode adds validation at critical points
     - Keep debug mode disabled in production for optimal performance
     """
-    def __init__(self, fast_mode=False, reduction="mean", loss_weight=1.0, eps=1e-6):
+    
+    _MIN_EDGE = 1e-3  # minimum allowed edge length
+    
+    def __init__(
+        self,
+        # Core parameters
+        reduction="mean",
+        loss_weight=1.0,
+        eps=1e-6,
+        # MGIoU2DPlusHybrid parameters
+        convex_weight=0.25,
+        loss_clip_max=2.0,
+        safe_saturate=True,
+        convex_normalization_pow=1.5,
+        adaptive_convex_pow=True,
+        # MGIoU-based adaptive parameters
+        p_min=1.2,
+        p_max=2.0,
+        k=5.0,
+        thresh=0.2,
+        ema_momentum=0.9,
+        dp_max=0.05,
+        # scale-based adaptive parameters
+        decades_to_full=3.0,
+        cap_ratio=1e4,
+        q_low=0.05,
+        q_high=0.95,
+    ):
         """
-        Initialize MGIoUPoly with optimization options.
+        Initialize MGIoUPoly loss function.
         
-        Args:
-            fast_mode: Use simplified GIoU computation (default: False)
+        Core Parameters:
             reduction: Loss reduction method: 'none', 'mean', or 'sum' (default: 'mean')
             loss_weight: Global weight for the loss (default: 1.0)
-            eps: Threshold for detecting degenerate edges (default: 1e-6)
-                 Edges with length < eps are considered padding artifacts
+            eps: Threshold for detecting degenerate edges and numerical stability (default: 1e-6)
+        
+        MGIoU2DPlusHybrid Parameters:
+            convex_weight: Weight for convexity penalty. 0 disables it. (default: 0.25)
+            loss_clip_max: Optional clip for numeric stability (default: 2.0)
+            safe_saturate: Apply tanh to avoid extreme MGIoU ratios (default: True)
+            convex_normalization_pow: Initial base exponent for normalization (default: 1.5)
+            adaptive_convex_pow: Enable automatic adaptive scheduling (default: True)
+            p_min, p_max: Bounds for adaptive exponent (default: 1.2, 2.0)
+            k: Steepness of sigmoid transition (default: 5.0)
+            thresh: MGIoU value where midpoint occurs (default: 0.2)
+            ema_momentum: EMA smoothing (default: 0.9)
+            dp_max: Max per-step change to avoid instability (default: 0.05)
+            decades_to_full: Log10 decades for full transition (default: 3.0)
+            cap_ratio: Upper bound for scale ratio (default: 1e4)
+            q_low, q_high: Percentiles for robust scale ratio (default: 0.05, 0.95)
         """
         super().__init__()
         if reduction not in {"none", "mean", "sum"}:
-            raise ValueError("reduction must be 'none', 'mean' or 'sum'")
+            raise ValueError("reduction must be 'none','mean' or 'sum'")
         
-        self.fast_mode = fast_mode
+        # Core parameters
         self.reduction = reduction
         self.loss_weight = loss_weight
         self.eps = eps
+        
+        # MGIoU2DPlusHybrid parameters
+        self.convex_weight = float(convex_weight)
+        self.loss_clip_max = None if loss_clip_max is None else float(loss_clip_max)
+        self.safe_saturate = bool(safe_saturate)
+        self.convex_norm_pow = float(convex_normalization_pow)
+        self.adaptive_convex_pow = adaptive_convex_pow
+        
+        # Adaptive parameters
+        self.p_min = p_min
+        self.p_max = p_max
+        self.k = k
+        self.thresh = thresh
+        self.ema_momentum = ema_momentum
+        self.dp_max = dp_max
+        self.decades_to_full = decades_to_full
+        self.cap_ratio = cap_ratio
+        self.q_low = q_low
+        self.q_high = q_high
+        
+        # Persistent states
+        self.register_buffer("_mgiou_ema", torch.tensor(0.0))
+        self.register_buffer("_prev_pow", torch.tensor(convex_normalization_pow))
 
     def forward(
         self,
@@ -373,8 +439,8 @@ class MGIoUPoly(nn.Module):
         Compute MGIoU loss for polygon predictions.
         
         Args:
-            pred: Predicted polygons [B, N, 2] where N is max vertices (padded if needed)
-            target: Target polygons [B, M, 2] where M is max vertices (padded if needed)
+            pred: Predicted polygons [B, N, 2] where N is number of vertices
+            target: Target polygons [B, N, 2] where N is number of vertices (same as pred)
             weight: Per-sample weights [B] or [B, 1] (optional)
             reduction_override: Override default reduction method (optional)
             avg_factor: Normalization factor for loss (optional, computed from weights if not provided)
@@ -391,9 +457,7 @@ class MGIoUPoly(nn.Module):
         if weight is not None:
             _check_nan_tensor(weight, "weight", "MGIoUPoly.forward input")
         
-        B, N, _ = pred.shape
-        M = target.shape[1]
-        
+        B = pred.shape[0]
         red = reduction_override or self.reduction
         
         # Detect completely degenerate targets (like MGIoURect strategy)
@@ -412,154 +476,63 @@ class MGIoUPoly(nn.Module):
         # Compute MGIoU for valid targets
         valid_mask = ~all_zero
         if valid_mask.any():
-            # Extract valid samples
             pred_valid = pred[valid_mask]
             target_valid = target[valid_mask]
             
-            # Sort vertices by angle to ensure consistent ordering
-            pred_sorted = self._sort_vertices(pred_valid)
-            target_sorted = self._sort_vertices(target_valid)
+            # Robust normalization of predictions
+            with torch.no_grad():
+                pred_center = pred_valid.mean(dim=1, keepdim=True)
+                pred_scale = self._mean_edge_length(pred_valid, eps=self.eps).clamp_min(self._MIN_EDGE).unsqueeze(-1).unsqueeze(-1)
             
-            # Debug check for sorted vertices
-            if _DEBUG_NAN:
-                _check_nan_tensor(pred_sorted, "pred_sorted", "MGIoUPoly.forward after sorting")
-                _check_nan_tensor(target_sorted, "target_sorted", "MGIoUPoly.forward after sorting")
-
-            # Get axes and validity masks (detects degenerate edges from padding)
-            axes1, mask1 = self._axes_with_mask(pred_sorted)
-            axes2, mask2 = self._axes_with_mask(target_sorted)
+            pred_norm = (pred_valid - pred_center) / pred_scale
             
-            # Debug check for axes
-            if _DEBUG_NAN:
-                _check_nan_tensor(axes1, "axes1", "MGIoUPoly.forward axes computation")
-                _check_nan_tensor(axes2, "axes2", "MGIoUPoly.forward axes computation")
+            target_center = target_valid.mean(dim=1, keepdim=True)
+            target_scale = self._mean_edge_length(target_valid, eps=self.eps).clamp_min(self.eps).unsqueeze(-1).unsqueeze(-1)
+            target_norm = (target_valid - target_center) / target_scale
             
-            axes = torch.cat((axes1, axes2), dim=1)  # [B_valid, N+M, 2]
-            mask = torch.cat((mask1, mask2), dim=1)  # [B_valid, N+M] - True = valid, False = degenerate
-
-            # Project vertices onto all axes (vectorized)
-            proj1 = torch.bmm(pred_sorted.to(axes.dtype), axes.transpose(1, 2))
-            proj2 = torch.bmm(target_sorted.to(axes.dtype), axes.transpose(1, 2))
+            # Compute MGIoU
+            mgiou, diag = self._mgiou_batch(pred_norm, target_norm)
+            loss = (1.0 - mgiou) * 0.5
             
-            # Safety: Replace NaN/Inf in projections only if present (gradient-preserving)
-            # This can happen with extreme polygon coordinates
-            proj1 = _safe_nan_to_num(proj1, nan=0.0, posinf=1e6, neginf=-1e6)
-            proj2 = _safe_nan_to_num(proj2, nan=0.0, posinf=1e6, neginf=-1e6)
+            # Adaptive convex normalization
+            if self.adaptive_convex_pow:
+                with torch.no_grad():
+                    m = mgiou.mean().detach()
+                    self._mgiou_ema.mul_(self.ema_momentum).add_((1 - self.ema_momentum) * m)
+                    
+                    alpha = torch.sigmoid(self.k * (self._mgiou_ema - self.thresh))
+                    p_from_mgiou = self.p_min + (self.p_max - self.p_min) * alpha
+                    
+                    edge_scale = self._mean_edge_length(target_valid, eps=self.eps)
+                    if edge_scale.numel() >= 6:
+                        low = torch.quantile(edge_scale, self.q_low)
+                        high = torch.quantile(edge_scale, self.q_high)
+                    else:
+                        low, high = edge_scale.min(), edge_scale.max()
+                    
+                    ratio = (high / (low + self.eps)).clamp(1.0, self.cap_ratio)
+                    decades = torch.log10(ratio)
+                    norm = (decades / self.decades_to_full).clamp(0.0, 1.0)
+                    p_from_scale = self.p_max - (self.p_max - self.p_min) * norm
+                    
+                    p = 0.5 * (p_from_mgiou + p_from_scale)
+                    p = p.clamp(self._prev_pow - self.dp_max, self._prev_pow + self.dp_max)
+                    self._prev_pow.copy_(p)
+                    self.convex_norm_pow = float(p)
             
-            min1, _ = proj1.min(dim=1)
-            max1, _ = proj1.max(dim=1)
-            min2, _ = proj2.min(dim=1)
-            max2, _ = proj2.max(dim=1)
+            # Convexity term (safe)
+            if self.convex_weight != 0.0:
+                convex_mask = self._is_convex(target_valid)
+                convex_raw = self._convexity_loss(pred_norm, eps=self.eps)  # normalized pred
+                edge_scale = self._mean_edge_length(target_valid, eps=self.eps)
+                denom = (edge_scale ** self.convex_norm_pow).clamp_min(self._MIN_EDGE)
+                convex_term = (convex_raw / denom) * self.convex_weight * convex_mask
+                loss = loss + convex_term
             
-            # Debug check for projections
-            if _DEBUG_NAN:
-                _check_nan_tensor(proj1, "proj1", "MGIoUPoly.forward projection")
-                _check_nan_tensor(proj2, "proj2", "MGIoUPoly.forward projection")
-                _check_nan_tensor(min1, "min1", "MGIoUPoly.forward projection")
-                _check_nan_tensor(max1, "max1", "MGIoUPoly.forward projection")
-                _check_nan_tensor(min2, "min2", "MGIoUPoly.forward projection")
-                _check_nan_tensor(max2, "max2", "MGIoUPoly.forward projection")
-
-            # Compute GIoU on each axis
-            # Note: _EPS prevents division by zero in edge cases
-            inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
-            hull  = torch.maximum(max1, max2) - torch.minimum(min1, min2)
+            if self.loss_clip_max is not None:
+                loss = torch.clamp(loss, 0.0, self.loss_clip_max)
             
-            # Safety: Replace NaN only if present (gradient-preserving)
-            # NaN can occur from numerical issues in projections (e.g., Inf - Inf)
-            inter = _safe_nan_to_num(inter, nan=0.0, posinf=1e6, neginf=0.0)
-            hull = _safe_nan_to_num(hull, nan=_EPS, posinf=1e6, neginf=_EPS)
-            
-            # Safety: Clamp hull to prevent division by very small values
-            # Hull near zero indicates degenerate/collapsed polygons on this axis
-            hull_safe = hull.clamp(min=_EPS)
-
-            if self.fast_mode:
-                # Simplified GIoU: intersection / hull
-                giou1d = inter / hull_safe
-                # Safety: Replace NaN only if present (gradient-preserving)
-                giou1d = _safe_nan_to_num(giou1d, nan=0.0, posinf=1.0, neginf=-1.0)
-            else:
-                # Match reference formula exactly: inter/union - (hull-union)/hull
-                union = (max1 - min1) + (max2 - min2) - inter
-                
-                # Safety: Clamp union to prevent negative or very small values
-                union_safe = union.clamp(min=_EPS)
-                
-                # Compute GIoU components safely
-                iou_term = inter / union_safe
-                penalty_term = (hull_safe - union_safe) / hull_safe
-                
-                # Safety: Replace NaN only if present (gradient-preserving)
-                # Can occur from 0/eps or other numerical instabilities
-                iou_term = _safe_nan_to_num(iou_term, nan=0.0, posinf=1.0, neginf=0.0)
-                penalty_term = _safe_nan_to_num(penalty_term, nan=0.0, posinf=1.0, neginf=0.0)
-                
-                giou1d = iou_term - penalty_term
-                
-                # Note: Removed GIoU clamping to preserve gradients
-                # GIoU should be in [-1, 1] by construction, and clamping zeros gradients at boundaries
-                # If values exceed [-1, 1], it indicates numerical issues that should be debugged, not masked
-            
-            # Debug check giou1d right after computation (before masking)
-            if _DEBUG_NAN:
-                extra_pre = {
-                    "inter": inter,
-                    "hull": hull,
-                    "hull_safe": hull_safe,
-                    "min1": min1,
-                    "max1": max1,
-                    "min2": min2,
-                    "max2": max2,
-                }
-                if not self.fast_mode:
-                    extra_pre.update({
-                        "union": union,
-                        "union_safe": union_safe,
-                        "iou_term": iou_term,
-                        "penalty_term": penalty_term,
-                    })
-                _check_nan_tensor(giou1d, "giou1d", "MGIoUPoly.forward immediately after GIoU computation", extra_pre)
-
-            # *** KEY: Gradient-preserving masked mean ***
-            # Instead of hard masking (which kills gradients), use conditional approach:
-            # - For polygons with mostly valid axes (>50%), compute regular mean (full gradients)
-            # - Only apply masking when necessary (heavily padded polygons)
-            # This preserves gradient flow while still handling degenerate edges correctly
-            valid_fraction = mask.float().mean(dim=1, keepdim=True)  # [B_valid, 1]
-            mostly_valid = valid_fraction > 0.5  # [B_valid, 1]
-            
-            # Compute both masked and unmasked means
-            mean_unmasked = giou1d.mean(dim=1)  # Full gradient flow
-            giou1d_masked = giou1d * mask.to(giou1d.dtype)
-            num_valid = mask.sum(dim=1).clamp(min=1)
-            mean_masked = giou1d_masked.sum(dim=1) / num_valid
-            
-            # Select based on valid fraction - mostly valid uses unmasked mean for better gradients
-            giou_val = torch.where(mostly_valid.squeeze(), mean_unmasked, mean_masked)
-            
-            # Debug check for GIoU computation with detailed intermediate values
-            if _DEBUG_NAN:
-                extra_info = {
-                    "inter": inter,
-                    "hull": hull,
-                    "hull_safe": hull_safe,
-                    "giou1d": giou1d,
-                    "giou1d_masked": giou1d_masked,
-                    "num_valid": num_valid,
-                    "mask": mask,
-                }
-                if not self.fast_mode:
-                    extra_info.update({
-                        "union": union,
-                        "union_safe": union_safe,
-                        "iou_term": iou_term,
-                        "penalty_term": penalty_term,
-                    })
-                _check_nan_tensor(giou_val, "giou_val", "MGIoUPoly.forward after GIoU computation", extra_info)
-            
-            # Convert to loss: (1 - GIoU) / 2, range [0, 1]
-            losses[valid_mask] = ((1.0 - giou_val) * 0.5).to(losses.dtype)
+            losses[valid_mask] = loss.to(losses.dtype)
         
         # Debug check before weighting
         _check_nan_tensor(losses, "losses", "MGIoUPoly.forward before weighting")
@@ -583,95 +556,102 @@ class MGIoUPoly(nn.Module):
         
         return final_loss
 
-    @staticmethod
-    def _sort_vertices(poly):
-        """
-        Sort vertices by angle from centroid.
+    def _mgiou_batch(self, c1: torch.Tensor, c2: torch.Tensor):
+        """Compute MGIoU for batch of normalized polygons."""
+        scale = self._mean_edge_length(c2, self.eps).unsqueeze(-1).unsqueeze(-1).clamp_min(self.eps)
+        c1n = (c1 - c1.mean(dim=1, keepdim=True)) / scale
+        c2n = (c2 - c2.mean(dim=1, keepdim=True)) / scale
         
-        NaN Prevention Strategy:
-        - Uses nan_to_num() which preserves gradient flow better than where()
-        - Replaces NaN with 0, Inf with large finite values
-        - For degenerate cases (all vertices same), sorting still works deterministically
-        """
-        B, N, _ = poly.shape
+        axes = torch.cat(
+            (self._candidate_axes_batch(c1n), self._candidate_axes_batch(c2n)), dim=1
+        )
         
-        # Safety: Replace NaN/Inf using nan_to_num which preserves gradients better
-        # nan -> 0.0, +inf -> max_float, -inf -> min_float
-        poly_safe = torch.nan_to_num(poly, nan=0.0, posinf=1e6, neginf=-1e6)
+        proj1 = torch.bmm(c1n, axes.transpose(1, 2))
+        proj2 = torch.bmm(c2n, axes.transpose(1, 2))
         
-        # Compute centroid
-        center = poly_safe.mean(dim=1, keepdim=True)  # [B, 1, 2]
+        min1, _ = proj1.min(dim=1)
+        max1, _ = proj1.max(dim=1)
+        min2, _ = proj2.min(dim=1)
+        max2, _ = proj2.max(dim=1)
         
-        # Compute angles from centroid
-        angles = torch.atan2(poly_safe[..., 1] - center[..., 1], poly_safe[..., 0] - center[..., 0])  # [B, N]
+        numerator = torch.minimum(max1, max2) - torch.maximum(min1, min2)
+        denominator = torch.maximum(max1, max2) - torch.minimum(min1, min2)
+        denominator = denominator.clamp_min(self.eps)
+        numerator = torch.clamp(numerator, -denominator, denominator)
         
-        # For degenerate polygons (all vertices same), atan2 returns 0 for all angles
-        # This is fine - they'll maintain their original order after sorting
-        angles = torch.nan_to_num(angles, nan=0.0)
+        giou1d = numerator / denominator
         
-        indices = angles.argsort(dim=1)  # [B, N]
-        return torch.gather(poly_safe, 1, indices.unsqueeze(-1).expand(-1, -1, 2))
+        if self.safe_saturate:
+            giou1d = torch.tanh(giou1d)
+        
+        mgiou = giou1d.mean(dim=1)
+        
+        diag = {
+            "giou1d_mean": giou1d.mean().detach(),
+            "giou1d_std": giou1d.std().detach() if giou1d.numel() > 1 else torch.tensor(0.0),
+            "edge_scale_mean": self._mean_edge_length(c2, self.eps).detach(),
+        }
+        
+        return mgiou.clamp(-1.0, 1.0), diag
 
-    def _axes_with_mask(self, poly):
-        """
-        Compute edge normals and validity mask.
-        
-        Returns:
-            normals: [B, N, 2] - edge normal vectors (normalized)
-            mask: [B, N] - True if edge is valid (length > eps), False if degenerate
-        
-        This automatically detects padding artifacts (repeated vertices) and excludes
-        their axes from the mean calculation, enabling correct mixed-vertex batching.
-        
-        NaN Prevention Strategy:
-        - Uses torch.nan_to_num() which preserves gradient flow better than torch.where()
-        - Replaces NaN with 0, Inf with large finite values (±1e6)
-        - Ensures at least one valid axis per sample to prevent all-invalid masks
-        - Edge length epsilon prevents division by zero in normalization
-        """
-        edges = poly.roll(-1, dims=1) - poly  # [B, N, 2]
-        
-        # Safety: Replace NaN/Inf only if present (gradient-preserving)
-        edges = _safe_nan_to_num(edges, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        edge_lengths = torch.norm(edges, dim=-1, keepdim=True)  # [B, N, 1]
-        
-        # Safety: Replace NaN/Inf only if present (gradient-preserving)
-        edge_lengths = _safe_nan_to_num(edge_lengths, nan=0.0, posinf=1e6, neginf=0.0)
-        
-        # Mark edges as valid if length > eps
-        # Degenerate edges (from padding) will have length ≈ 0
-        mask = (edge_lengths.squeeze(-1) > self.eps)  # [B, N]
-        
-        # Safety: Ensure at least one valid axis per sample
-        # If all edges are degenerate, mark first edge as valid to prevent division by zero
-        all_invalid = ~mask.any(dim=1)  # [B]
-        if all_invalid.any():
-            mask[all_invalid, 0] = True
-            # Give the first edge a small non-zero length to prevent NaN in normalization
-            edge_lengths[all_invalid, 0, :] = _EPS
-        
-        # Compute normals using (dy, -dx) convention to match MGIoU2DPlus
-        normals = torch.stack((edges[..., 1], -edges[..., 0]), dim=-1).to(edges.dtype)
-        
-        # Normalize normals to prevent extreme projection values
-        # Use safe division: divide by (length + eps) to prevent division by zero
-        normals = normals / (edge_lengths + _EPS)
-        
-        # Safety: Final cleanup only if NaN/Inf present (gradient-preserving)
-        normals = _safe_nan_to_num(normals, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        return normals, mask
-    
+    @staticmethod
+    def _candidate_axes_batch(corners: torch.Tensor) -> torch.Tensor:
+        """Generate candidate projection axes from polygon edges."""
+        center = corners.mean(dim=1, keepdim=True)
+        rel = corners - center
+        angles = torch.atan2(rel[..., 1], rel[..., 0])
+        idx = angles.argsort(dim=1)
+        sorted_corners = torch.gather(corners, 1, idx.unsqueeze(-1).expand_as(corners))
+        edges = sorted_corners.roll(-1, dims=1) - sorted_corners
+        normals = torch.stack((edges[..., 1], -edges[..., 0]), dim=-1)
+        return normals
+
+    def _convexity_loss(self, polygons: torch.Tensor, eps: float = None) -> torch.Tensor:
+        """Compute convexity penalty for polygons."""
+        if eps is None:
+            eps = self.eps
+        v_prev = polygons.roll(1, 1)
+        v_next = polygons.roll(-1, 1)
+        e1 = v_prev - polygons
+        e2 = v_next - polygons
+        cross = e1[..., 0] * e2[..., 1] - e1[..., 1] * e2[..., 0]
+        sign_ref = torch.where(
+            cross[:, 0:1].abs() <= eps, torch.ones_like(cross[:, 0:1]), cross[:, 0:1]
+        ).sign()
+        penalty = torch.clamp(-sign_ref * cross, 0.0)
+        return penalty.mean(dim=1)
+
+    def _is_convex(self, polygons: torch.Tensor, eps: float = None) -> torch.Tensor:
+        """Check if polygons are convex."""
+        if eps is None:
+            eps = self.eps
+        v_prev = polygons.roll(1, 1)
+        v_next = polygons.roll(-1, 1)
+        e1 = v_prev - polygons
+        e2 = v_next - polygons
+        cross = e1[..., 0] * e2[..., 1] - e1[..., 1] * e2[..., 0]
+        sign_ref = torch.where(
+            cross[:, 0:1].abs() <= eps, torch.ones_like(cross[:, 0:1]), cross[:, 0:1]
+        ).sign()
+        same_sign = (cross * sign_ref > -eps).all(dim=1)
+        return same_sign.float()
+
+    def _mean_edge_length(self, polygons: torch.Tensor, eps: float = None) -> torch.Tensor:
+        """Compute mean edge length for polygons."""
+        if eps is None:
+            eps = self.eps
+        edges = polygons.roll(-1, dims=1) - polygons
+        return edges.norm(dim=-1).mean(dim=1).clamp(min=eps)
+
     @staticmethod
     def _reduce(loss: torch.Tensor, reduction: str) -> torch.Tensor:
         """Apply reduction to loss tensor."""
+        if reduction == "none":
+            return loss
         if reduction == "mean":
             return loss.mean()
         if reduction == "sum":
             return loss.sum()
-        if reduction == "none":
-            return loss
         raise ValueError(f"Unsupported reduction: {reduction!r}")
 
 class BboxLoss(nn.Module):
@@ -860,9 +840,8 @@ class PolygonLoss(nn.Module):
             
             weights = area.squeeze(-1)
             
-            mgiou_losses = self.mgiou_loss(pred_poly, gt_poly, weight=weights)
-            
-            total_loss = mgiou_losses.mean()
+            # MGIoUPoly already returns scalar with reduction='mean', no need for additional .mean()
+            total_loss = self.mgiou_loss(pred_poly, gt_poly, weight=weights)
             
             # Debug check for output
             _check_nan_tensor(total_loss, "total_loss (mgiou)", "PolygonLoss.forward output")

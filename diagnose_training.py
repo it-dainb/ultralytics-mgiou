@@ -56,7 +56,7 @@ def diagnose_mgiou():
     print(f"  Target valid polygons: {(target.abs().sum(dim=(1,2)) > 0.01).sum().item()}/{batch_size}")
     
     # Initialize loss
-    loss_fn = MGIoUPoly(fast_mode=False)
+    loss_fn = MGIoUPoly()
     
     # Forward pass
     print("\nComputing loss...")
@@ -120,7 +120,7 @@ def test_with_cls_loss():
     cls_target = torch.randint(0, 10, (8,))
     
     # Compute losses
-    poly_loss_fn = MGIoUPoly(fast_mode=False)
+    poly_loss_fn = MGIoUPoly()
     poly_loss = poly_loss_fn(poly_pred, poly_target, stride)
     
     cls_loss = F.cross_entropy(cls_pred, cls_target)

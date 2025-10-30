@@ -22,7 +22,7 @@ def test_gradient_flow():
     print("=" * 60)
     
     # Create MGIoU loss
-    mgiou_loss = MGIoUPoly(fast_mode=False, reduction="mean", eps=1e-6)
+    mgiou_loss = MGIoUPoly(reduction="mean", eps=1e-6)
     
     # Create synthetic polygon predictions (requires_grad=True to track gradients)
     batch_size = 4
@@ -119,7 +119,7 @@ def test_edge_cases():
     print("Testing Edge Cases")
     print("=" * 60)
     
-    mgiou_loss = MGIoUPoly(fast_mode=False, reduction="mean", eps=1e-6)
+    mgiou_loss = MGIoUPoly(reduction="mean", eps=1e-6)
     
     # Test 1: Degenerate target (all zeros)
     print("\nTest 1: Degenerate target (all zeros)")
@@ -136,36 +136,45 @@ def test_edge_cases():
     
     # Test 2: Identical polygons
     print("\nTest 2: Identical polygons")
-    pred = torch.randn(2, 4, 2, requires_grad=True)
-    target = pred.detach().clone()
+    pred2 = torch.randn(2, 4, 2, requires_grad=True)
+    target2 = pred2.detach().clone()
     
-    loss = mgiou_loss(pred, target)
+    loss = mgiou_loss(pred2, target2)
     print(f"  Loss: {loss.item():.6f} (should be close to 0)")
     print(f"  Loss is finite: {torch.isfinite(loss).item()}")
     
+    loss.backward()
+    print(f"  Gradients exist: {pred2.grad is not None}")
+    if pred2.grad is not None:
+        print(f"  Gradients finite: {torch.isfinite(pred2.grad).all().item()}")
+    
     # Test 3: Very small polygons
     print("\nTest 3: Very small polygons")
-    pred = torch.randn(2, 4, 2, requires_grad=True) * 0.001
-    target = torch.randn(2, 4, 2) * 0.001
+    pred3 = torch.randn(2, 4, 2, requires_grad=True) * 0.001
+    target3 = torch.randn(2, 4, 2) * 0.001
     
-    loss = mgiou_loss(pred, target)
+    loss = mgiou_loss(pred3, target3)
     print(f"  Loss: {loss.item():.6f}")
     print(f"  Loss is finite: {torch.isfinite(loss).item()}")
     
     loss.backward()
-    print(f"  Gradients finite: {torch.isfinite(pred.grad).all().item()}")
+    print(f"  Gradients exist: {pred3.grad is not None}")
+    if pred3.grad is not None:
+        print(f"  Gradients finite: {torch.isfinite(pred3.grad).all().item()}")
     
     # Test 4: Very large polygons
     print("\nTest 4: Very large polygons")
-    pred = torch.randn(2, 4, 2, requires_grad=True) * 1000
-    target = torch.randn(2, 4, 2) * 1000
+    pred4 = torch.randn(2, 4, 2, requires_grad=True) * 1000
+    target4 = torch.randn(2, 4, 2) * 1000
     
-    loss = mgiou_loss(pred, target)
+    loss = mgiou_loss(pred4, target4)
     print(f"  Loss: {loss.item():.6f}")
     print(f"  Loss is finite: {torch.isfinite(loss).item()}")
     
     loss.backward()
-    print(f"  Gradients finite: {torch.isfinite(pred.grad).all().item()}")
+    print(f"  Gradients exist: {pred4.grad is not None}")
+    if pred4.grad is not None:
+        print(f"  Gradients finite: {torch.isfinite(pred4.grad).all().item()}")
     
     print("\n" + "=" * 60)
     print("✅ SUCCESS: All edge cases handled correctly!")
@@ -179,7 +188,7 @@ def test_training_simulation():
     print("Simulating Training Iterations")
     print("=" * 60)
     
-    mgiou_loss = MGIoUPoly(fast_mode=False, reduction="mean", eps=1e-6)
+    mgiou_loss = MGIoUPoly(reduction="mean", eps=1e-6)
     
     # Create learnable predictions
     pred_poly = torch.randn(4, 4, 2, requires_grad=True)

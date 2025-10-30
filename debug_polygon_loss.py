@@ -48,12 +48,11 @@ def check_tensor(tensor: torch.Tensor, name: str, step: str) -> dict:
 class MGIoUPolyDebug(nn.Module):
     """Debug version of MGIoUPoly with extensive validation."""
     
-    def __init__(self, fast_mode=False, reduction="mean", loss_weight=1.0, eps=1e-6):
+    def __init__(self, reduction="mean", loss_weight=1.0, eps=1e-6):
         super().__init__()
         if reduction not in {"none", "mean", "sum"}:
             raise ValueError("reduction must be 'none', 'mean' or 'sum'")
         
-        self.fast_mode = fast_mode
         self.reduction = reduction
         self.loss_weight = loss_weight
         self.eps = eps
@@ -162,18 +161,16 @@ class MGIoUPolyDebug(nn.Module):
             if small_hull > 0:
                 self.debug_info.append(f"⚠️  {small_hull} hull values < {_SAFE_EPS}")
             
-            if self.fast_mode:
-                giou1d = inter / (hull + _EPS)
-            else:
-                union = (max1 - min1) + (max2 - min2) - inter
-                check_tensor(union, "union", "after_union")
-                
-                # Check for zero or near-zero union values
-                small_union = (union < _SAFE_EPS).sum().item()
-                if small_union > 0:
-                    self.debug_info.append(f"⚠️  {small_union} union values < {_SAFE_EPS}")
-                
-                giou1d = inter / (union + _EPS) - (hull - union) / (hull + _EPS)
+            # Compute GIoU using union method
+            union = (max1 - min1) + (max2 - min2) - inter
+            check_tensor(union, "union", "after_union")
+            
+            # Check for zero or near-zero union values
+            small_union = (union < _SAFE_EPS).sum().item()
+            if small_union > 0:
+                self.debug_info.append(f"⚠️  {small_union} union values < {_SAFE_EPS}")
+            
+            giou1d = inter / (union + _EPS) - (hull - union) / (hull + _EPS)
             
             check_tensor(giou1d, "giou1d", "after_giou_computation")
             
