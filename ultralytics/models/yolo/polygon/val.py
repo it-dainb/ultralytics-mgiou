@@ -205,9 +205,19 @@ class PolygonValidator(DetectionValidator):
         if gt_cls.shape[0] == 0 or preds["cls"].shape[0] == 0:
             tp_p = np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)
         else:
+            # Sanitize predictions to avoid Inf/NaN during validation
+            # This can happen in early training when model is unstable
+            pred_kpts = preds["keypoints"]
+            if torch.isnan(pred_kpts).any() or torch.isinf(pred_kpts).any():
+                LOGGER.warning(
+                    f"Detected NaN/Inf in polygon predictions during validation. "
+                    f"Replacing with safe values. This may indicate unstable training."
+                )
+                pred_kpts = torch.nan_to_num(pred_kpts, nan=0.0, posinf=1e6, neginf=-1e6)
+            
             # Use polygon IoU instead of keypoint-based OKS
             # poly_iou returns GIoU-based scores in range [-1, 1]
-            iou = poly_iou(batch["keypoints"], preds["keypoints"])
+            iou = poly_iou(batch["keypoints"], pred_kpts)
             tp_p = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
         tp.update({"tp_p": tp_p})  # update tp with polygon IoU
         return tp

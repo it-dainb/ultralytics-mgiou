@@ -217,6 +217,13 @@ def poly_iou(poly1: torch.Tensor, poly2: torch.Tensor, eps: float = 1e-7) -> tor
     if N == 0 or M == 0:
         return torch.zeros((N, M), device=poly1.device, dtype=poly1.dtype)
     
+    # Sanitize inputs: replace NaN/Inf with safe values
+    # This can happen during validation when model predictions are unstable
+    if torch.isnan(poly1).any() or torch.isinf(poly1).any():
+        poly1 = torch.nan_to_num(poly1, nan=0.0, posinf=1e6, neginf=-1e6)
+    if torch.isnan(poly2).any() or torch.isinf(poly2).any():
+        poly2 = torch.nan_to_num(poly2, nan=0.0, posinf=1e6, neginf=-1e6)
+    
     # Expand for pairwise comparison: (N, M, num_vertices, 2)
     poly1_expanded = poly1.unsqueeze(1).expand(N, M, -1, -1).reshape(N * M, -1, 2)
     poly2_expanded = poly2.unsqueeze(0).expand(N, M, -1, -1).reshape(N * M, -1, 2)
