@@ -454,6 +454,8 @@ class MGIoUPoly(nn.Module):
             if self.fast_mode:
                 # Simplified GIoU: intersection / hull
                 giou1d = inter / hull_safe
+                # Safety: Replace NaN from division issues
+                giou1d = torch.where(torch.isnan(giou1d), torch.zeros_like(giou1d), giou1d)
             else:
                 # Match reference formula exactly: inter/union - (hull-union)/hull
                 union = (max1 - min1) + (max2 - min2) - inter
@@ -464,6 +466,12 @@ class MGIoUPoly(nn.Module):
                 # Compute GIoU components safely
                 iou_term = inter / union_safe
                 penalty_term = (hull_safe - union_safe) / hull_safe
+                
+                # Safety: Replace NaN in intermediate terms
+                # Can occur from 0/eps or other numerical instabilities
+                iou_term = torch.where(torch.isnan(iou_term), torch.zeros_like(iou_term), iou_term)
+                penalty_term = torch.where(torch.isnan(penalty_term), torch.zeros_like(penalty_term), penalty_term)
+                
                 giou1d = iou_term - penalty_term
                 
                 # Additional safety: Clamp GIoU to valid range [-1, 1]
@@ -492,11 +500,6 @@ class MGIoUPoly(nn.Module):
 
             # *** KEY: Masked mean - only average over valid (non-degenerate) axes ***
             # This allows correct batching of polygons with different vertex counts!
-            
-            # Safety: Replace any NaN in giou1d with 0.0 before masking
-            # NaN can occur from numerical instability in edge cases, but should be masked out anyway
-            giou1d = torch.where(torch.isnan(giou1d), torch.zeros_like(giou1d), giou1d)
-            
             giou1d_masked = giou1d * mask.to(giou1d.dtype)  # zero out invalid axes
             num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
             giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
