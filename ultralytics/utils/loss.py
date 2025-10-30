@@ -18,6 +18,41 @@ from .tal import bbox2dist
 
 _EPS = 1e-9
 
+# Global flag for NaN debugging - can be enabled via environment variable or code
+# Set ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks
+import os
+_DEBUG_NAN = os.environ.get("ULTRALYTICS_DEBUG_NAN", "0") == "1"
+
+def _check_nan_tensor(tensor: torch.Tensor, name: str, location: str) -> None:
+    """
+    Debug utility to check for NaN/Inf values in tensors.
+    Only runs when _DEBUG_NAN is True.
+    
+    Args:
+        tensor: Tensor to check
+        name: Name/description of the tensor
+        location: Location in code where check is performed
+    
+    Raises:
+        RuntimeError: If NaN or Inf detected and debug mode is enabled
+    """
+    if not _DEBUG_NAN:
+        return
+    
+    if torch.isnan(tensor).any():
+        raise RuntimeError(
+            f"NaN detected in {name} at {location}\n"
+            f"Shape: {tensor.shape}\n"
+            f"NaN count: {torch.isnan(tensor).sum().item()}"
+        )
+    
+    if torch.isinf(tensor).any():
+        raise RuntimeError(
+            f"Inf detected in {name} at {location}\n"
+            f"Shape: {tensor.shape}\n"
+            f"Inf count: {torch.isinf(tensor).sum().item()}"
+        )
+
 class VarifocalLoss(nn.Module):
     """
     Varifocal loss by Zhang et al.
@@ -242,6 +277,20 @@ class MGIoUPoly(nn.Module):
     - Automatic padding artifact detection and removal
     - Weighted loss computation
     - Flexible reduction strategies
+    
+    NaN Prevention Mechanisms:
+    - Degenerate targets (all zeros) automatically fall back to L1 loss
+    - Degenerate edges (repeated vertices from padding) are detected and masked out
+    - Division operations use epsilon (_EPS = 1e-9) to prevent division by zero
+    - Masked mean computation only averages over valid axes (non-degenerate edges)
+    - Edge length detection filters out padding artifacts (edges < eps)
+    - All clamp operations use safe minimum values
+    
+    Debugging:
+    - Set environment variable ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN/Inf checks
+    - Debug mode adds validation at critical points: inputs, GIoU computation, weighting, output
+    - Raises RuntimeError with detailed diagnostics if NaN/Inf detected
+    - Keep debug mode disabled in production for optimal performance
     """
     def __init__(self, fast_mode=False, reduction="mean", loss_weight=1.0, eps=1e-6):
         """
@@ -283,7 +332,16 @@ class MGIoUPoly(nn.Module):
             
         Returns:
             Computed loss value (scalar if reduction != 'none', else [B])
+        
+        Note:
+            Set environment variable ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks.
         """
+        # Debug checks for inputs (only runs if _DEBUG_NAN is True)
+        _check_nan_tensor(pred, "pred", "MGIoUPoly.forward input")
+        _check_nan_tensor(target, "target", "MGIoUPoly.forward input")
+        if weight is not None:
+            _check_nan_tensor(weight, "weight", "MGIoUPoly.forward input")
+        
         B, N, _ = pred.shape
         M = target.shape[1]
         
@@ -329,10 +387,12 @@ class MGIoUPoly(nn.Module):
             max2, _ = proj2.max(dim=1)
 
             # Compute GIoU on each axis
+            # Note: _EPS prevents division by zero in edge cases
             inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
             hull  = torch.maximum(max1, max2) - torch.minimum(min1, min2)
 
             if self.fast_mode:
+                # Simplified GIoU: intersection / hull
                 giou1d = inter / (hull + _EPS)
             else:
                 # Match reference formula exactly: inter/union - (hull-union)/hull
@@ -345,7 +405,14 @@ class MGIoUPoly(nn.Module):
             num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
             giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
             
+            # Debug check for GIoU computation
+            _check_nan_tensor(giou_val, "giou_val", "MGIoUPoly.forward after GIoU computation")
+            
+            # Convert to loss: (1 - GIoU) / 2, range [0, 1]
             losses[valid_mask] = ((1.0 - giou_val) * 0.5).to(losses.dtype)
+        
+        # Debug check before weighting
+        _check_nan_tensor(losses, "losses", "MGIoUPoly.forward before weighting")
         
         # --- weighting & reduction (matching MGIoURect behavior) ---
         if weight is not None:
@@ -360,7 +427,11 @@ class MGIoUPoly(nn.Module):
         if avg_factor is not None:
             loss = loss / avg_factor
         
-        return (loss * self.loss_weight).to(pred.dtype)
+        # Debug check for final loss
+        final_loss = (loss * self.loss_weight).to(pred.dtype)
+        _check_nan_tensor(final_loss, "final_loss", "MGIoUPoly.forward output")
+        
+        return final_loss
 
     @staticmethod
     def _sort_vertices(poly):
@@ -536,7 +607,25 @@ class KeypointLoss(nn.Module):
 
 
 class PolygonLoss(nn.Module):
-    """Criterion class for computing polygon losses using MGIoU or L2 distance."""
+    """
+    Criterion class for computing polygon losses using MGIoU or L2 distance.
+    
+    This loss supports two modes:
+    1. MGIoU mode (use_mgiou=True): Uses MGIoUPoly for geometry-aware loss
+    2. L2 mode (use_mgiou=False): Uses normalized L2 distance with area weighting
+    
+    NaN Prevention (L2 Mode):
+    - Area values are clamped to minimum 1e-6 to prevent division by very small numbers
+    - Additional epsilon (1e-9) added to denominator for numerical stability
+    - kpt_loss_factor uses epsilon to avoid division by zero when all keypoints masked
+    
+    NaN Prevention (MGIoU Mode):
+    - Inherits all NaN prevention mechanisms from MGIoUPoly class
+    - See MGIoUPoly documentation for detailed safety features
+    
+    Debugging:
+    - Set ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks in both modes
+    """
 
     def __init__(self, use_mgiou: bool = False) -> None:
         """Initialize the PolygonLoss class with optional MGIoU loss."""
@@ -557,7 +646,15 @@ class PolygonLoss(nn.Module):
             
         Returns:
             Tuple of (total_loss, mgiou_loss) where mgiou_loss is 0 if not using MGIoU
+            
+        Note:
+            Set environment variable ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks.
         """
+        # Debug checks for inputs
+        _check_nan_tensor(pred_kpts, "pred_kpts", "PolygonLoss.forward input")
+        _check_nan_tensor(gt_kpts, "gt_kpts", "PolygonLoss.forward input")
+        _check_nan_tensor(area, "area", "PolygonLoss.forward input")
+        
         if self.mgiou_loss:
             pred_poly = pred_kpts[..., :2]
             gt_poly = gt_kpts[..., :2]
@@ -567,15 +664,25 @@ class PolygonLoss(nn.Module):
             mgiou_losses = self.mgiou_loss(pred_poly, gt_poly, weight=weights)
             
             total_loss = mgiou_losses.mean()
+            
+            # Debug check for output
+            _check_nan_tensor(total_loss, "total_loss (mgiou)", "PolygonLoss.forward output")
+            
             return total_loss, total_loss
         else:
             d = (pred_kpts[..., 0] - gt_kpts[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_kpts[..., 1]).pow(2)
             kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
             
-            e = d / (area + 1e-9)
+            # Clamp area to prevent division by very small numbers that can cause numerical instability
+            area_safe = area.clamp(min=1e-6)
+            e = d / (area_safe + 1e-9)
             
             l2_loss = (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
             mgiou_loss = torch.tensor(0.0).to(pred_kpts.device)
+            
+            # Debug check for output
+            _check_nan_tensor(l2_loss, "l2_loss", "PolygonLoss.forward output")
+            
             return l2_loss, mgiou_loss
 
 class v8DetectionLoss:
@@ -1119,6 +1226,14 @@ class v8PolygonLoss(v8DetectionLoss):
         target_bboxes: torch.Tensor,
         pred_poly: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Calculate polygon loss with safety checks to prevent NaN.
+        
+        Potential NaN sources handled:
+        1. Division by stride_tensor (ensured non-zero by design)
+        2. Area calculation from degenerate bboxes (clamped in PolygonLoss)
+        3. MGIoU computation with degenerate polygons (handled by MGIoUPoly)
+        """
         batch_idx = batch_idx.flatten()
         polys_loss = torch.zeros(1, device=self.device)
 
@@ -1128,8 +1243,13 @@ class v8PolygonLoss(v8DetectionLoss):
                 target_gt_idx_i = target_gt_idx[i][fg_mask_i]
                 gt_matching_bs = batch_idx[target_gt_idx_i].long()
                 gt_poly_scaled = gt_poly[gt_matching_bs]
+                
+                # Scale by stride - stride_tensor should never be zero by design
+                # (it comes from model.stride which is set during model initialization)
                 gt_poly_scaled[..., 0] /= stride_tensor[i]
                 gt_poly_scaled[..., 1] /= stride_tensor[i]
+                
+                # Compute area from target bboxes - will be clamped in PolygonLoss if too small
                 area = xyxy2xywh(target_bboxes[i][fg_mask_i])[:, 2:].prod(1, keepdim=True)
                 pred_poly_i = pred_poly[i][fg_mask_i]
                 poly_mask = torch.full_like(gt_poly_scaled[..., 0], True)
