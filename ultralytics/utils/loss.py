@@ -1029,7 +1029,7 @@ class v8PoseLoss(v8DetectionLoss):
 class v8PolygonLoss(v8DetectionLoss):
 
     def __init__(self, model, use_mgiou: bool = False):
-        super().__init__(model)
+        super().__init__(model, use_mgiou=use_mgiou)
         self.poly_shape = model.model[-1].poly_shape
         self.bce_poly = nn.BCEWithLogitsLoss()
         npoly = self.poly_shape[0]
