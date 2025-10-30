@@ -461,6 +461,23 @@ class Polygon(Detect):
         pred_poly = self.polygons_decode(bs, poly)
         return torch.cat([x, pred_poly], 1) if self.export else (torch.cat([x[0], pred_poly], 1), (x[1], poly))
 
+    def bias_init(self):
+        """Initialize Polygon head biases, including the polygon prediction head (cv4)."""
+        # First initialize the base Detect biases (cv2, cv3)
+        super().bias_init()
+        
+        # Initialize polygon head (cv4) biases
+        # The polygon head predicts relative offsets from anchor points
+        # Initialize biases to 0 so predictions start near the anchor center
+        for cv4_layer in self.cv4:
+            # cv4_layer is a Sequential containing: Conv, Conv, nn.Conv2d
+            # We want to initialize the final Conv2d layer's bias
+            final_conv = cv4_layer[-1]  # Last layer is nn.Conv2d
+            if hasattr(final_conv, 'bias') and final_conv.bias is not None:
+                # Initialize to small values near 0
+                # This makes initial predictions close to anchor centers
+                final_conv.bias.data.fill_(0.0)
+
     def polygons_decode(self, bs: int, polys: torch.Tensor) -> torch.Tensor:
         """Decode polygon vertex predictions with safety checks to prevent Inf values."""
         ndim = self.poly_shape[1]
