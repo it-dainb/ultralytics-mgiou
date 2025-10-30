@@ -23,7 +23,7 @@ _EPS = 1e-9
 import os
 _DEBUG_NAN = os.environ.get("ULTRALYTICS_DEBUG_NAN", "0") == "1"
 
-def _check_nan_tensor(tensor: torch.Tensor, name: str, location: str) -> None:
+def _check_nan_tensor(tensor: torch.Tensor, name: str, location: str, extra_info: dict = None) -> None:
     """
     Debug utility to check for NaN/Inf values in tensors.
     Only runs when _DEBUG_NAN is True.
@@ -32,6 +32,7 @@ def _check_nan_tensor(tensor: torch.Tensor, name: str, location: str) -> None:
         tensor: Tensor to check
         name: Name/description of the tensor
         location: Location in code where check is performed
+        extra_info: Optional dict with additional debug information
     
     Raises:
         RuntimeError: If NaN or Inf detected and debug mode is enabled
@@ -40,11 +41,36 @@ def _check_nan_tensor(tensor: torch.Tensor, name: str, location: str) -> None:
         return
     
     if torch.isnan(tensor).any():
-        raise RuntimeError(
+        nan_mask = torch.isnan(tensor)
+        error_msg = (
             f"NaN detected in {name} at {location}\n"
             f"Shape: {tensor.shape}\n"
-            f"NaN count: {torch.isnan(tensor).sum().item()}"
+            f"NaN count: {nan_mask.sum().item()}"
         )
+        
+        # Add statistics for non-NaN values
+        if not nan_mask.all():
+            valid_vals = tensor[~nan_mask]
+            error_msg += (
+                f"\n\nValid value statistics:\n"
+                f"  Min: {valid_vals.min().item():.6e}\n"
+                f"  Max: {valid_vals.max().item():.6e}\n"
+                f"  Mean: {valid_vals.mean().item():.6e}"
+            )
+        
+        # Add extra debug info if provided
+        if extra_info:
+            error_msg += "\n\nAdditional debug info:"
+            for key, val in extra_info.items():
+                if torch.is_tensor(val):
+                    error_msg += f"\n  {key}: shape={val.shape}, has_nan={torch.isnan(val).any().item()}"
+                    if not torch.isnan(val).all():
+                        valid = val[~torch.isnan(val)]
+                        error_msg += f", min={valid.min().item():.6e}, max={valid.max().item():.6e}"
+                else:
+                    error_msg += f"\n  {key}: {val}"
+        
+        raise RuntimeError(error_msg)
     
     if torch.isinf(tensor).any():
         raise RuntimeError(
@@ -391,6 +417,12 @@ class MGIoUPoly(nn.Module):
             # Project vertices onto all axes (vectorized)
             proj1 = torch.bmm(pred_sorted.to(axes.dtype), axes.transpose(1, 2))
             proj2 = torch.bmm(target_sorted.to(axes.dtype), axes.transpose(1, 2))
+            
+            # Safety: Replace NaN/Inf in projections with safe values
+            # This can happen with extreme polygon coordinates
+            proj1 = torch.where(torch.isnan(proj1) | torch.isinf(proj1), torch.zeros_like(proj1), proj1)
+            proj2 = torch.where(torch.isnan(proj2) | torch.isinf(proj2), torch.zeros_like(proj2), proj2)
+            
             min1, _ = proj1.min(dim=1)
             max1, _ = proj1.max(dim=1)
             min2, _ = proj2.min(dim=1)
@@ -409,6 +441,11 @@ class MGIoUPoly(nn.Module):
             # Note: _EPS prevents division by zero in edge cases
             inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
             hull  = torch.maximum(max1, max2) - torch.minimum(min1, min2)
+            
+            # Safety: Replace NaN values with safe defaults before clamping
+            # NaN can occur from numerical issues in projections (e.g., Inf - Inf)
+            inter = torch.where(torch.isnan(inter), torch.zeros_like(inter), inter)
+            hull = torch.where(torch.isnan(hull), torch.full_like(hull, _EPS), hull)
             
             # Safety: Clamp hull to prevent division by very small values
             # Hull near zero indicates degenerate/collapsed polygons on this axis
@@ -432,15 +469,57 @@ class MGIoUPoly(nn.Module):
                 # Additional safety: Clamp GIoU to valid range [-1, 1]
                 # GIoU should theoretically be in [-1, 1], but numerical issues can push it outside
                 giou1d = giou1d.clamp(min=-1.0, max=1.0)
+            
+            # Debug check giou1d right after computation (before masking)
+            if _DEBUG_NAN:
+                extra_pre = {
+                    "inter": inter,
+                    "hull": hull,
+                    "hull_safe": hull_safe,
+                    "min1": min1,
+                    "max1": max1,
+                    "min2": min2,
+                    "max2": max2,
+                }
+                if not self.fast_mode:
+                    extra_pre.update({
+                        "union": union,
+                        "union_safe": union_safe,
+                        "iou_term": iou_term,
+                        "penalty_term": penalty_term,
+                    })
+                _check_nan_tensor(giou1d, "giou1d", "MGIoUPoly.forward immediately after GIoU computation", extra_pre)
 
             # *** KEY: Masked mean - only average over valid (non-degenerate) axes ***
             # This allows correct batching of polygons with different vertex counts!
+            
+            # Safety: Replace any NaN in giou1d with 0.0 before masking
+            # NaN can occur from numerical instability in edge cases, but should be masked out anyway
+            giou1d = torch.where(torch.isnan(giou1d), torch.zeros_like(giou1d), giou1d)
+            
             giou1d_masked = giou1d * mask.to(giou1d.dtype)  # zero out invalid axes
             num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
             giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
             
-            # Debug check for GIoU computation
-            _check_nan_tensor(giou_val, "giou_val", "MGIoUPoly.forward after GIoU computation")
+            # Debug check for GIoU computation with detailed intermediate values
+            if _DEBUG_NAN:
+                extra_info = {
+                    "inter": inter,
+                    "hull": hull,
+                    "hull_safe": hull_safe,
+                    "giou1d": giou1d,
+                    "giou1d_masked": giou1d_masked,
+                    "num_valid": num_valid,
+                    "mask": mask,
+                }
+                if not self.fast_mode:
+                    extra_info.update({
+                        "union": union,
+                        "union_safe": union_safe,
+                        "iou_term": iou_term,
+                        "penalty_term": penalty_term,
+                    })
+                _check_nan_tensor(giou_val, "giou_val", "MGIoUPoly.forward after GIoU computation", extra_info)
             
             # Convert to loss: (1 - GIoU) / 2, range [0, 1]
             losses[valid_mask] = ((1.0 - giou_val) * 0.5).to(losses.dtype)
