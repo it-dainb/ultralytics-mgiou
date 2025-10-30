@@ -462,12 +462,23 @@ class Polygon(Detect):
         return torch.cat([x, pred_poly], 1) if self.export else (torch.cat([x[0], pred_poly], 1), (x[1], poly))
 
     def polygons_decode(self, bs: int, polys: torch.Tensor) -> torch.Tensor:
-        """Decode polygon vertex predictions."""
+        """Decode polygon vertex predictions with safety checks to prevent Inf values."""
         ndim = self.poly_shape[1]
         y = polys.clone()
+        
+        # Safety: Clamp raw predictions to prevent Inf after multiplication
+        # Raw predictions should typically be in range [-10, 10] after sigmoid-like behavior
+        # Values outside [-50, 50] are likely from numerical instability
+        y = torch.clamp(y, min=-50.0, max=50.0)
+        
         # Decode (x, y) coordinates relative to anchor grid and strides
         y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
         y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+        
+        # Final safety check: clamp decoded coordinates to reasonable image bounds
+        # Maximum image dimension is unlikely to exceed 100,000 pixels
+        y = torch.clamp(y, min=-1e5, max=1e5)
+        
         return y
 
 
