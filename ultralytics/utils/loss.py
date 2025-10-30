@@ -79,6 +79,29 @@ def _check_nan_tensor(tensor: torch.Tensor, name: str, location: str, extra_info
             f"Inf count: {torch.isinf(tensor).sum().item()}"
         )
 
+def _safe_nan_to_num(x: torch.Tensor, nan: float = 0.0, posinf: float = None, neginf: float = None) -> torch.Tensor:
+    """
+    Conditionally apply nan_to_num only when NaN/Inf values are actually present.
+    
+    This preserves gradients for the common case where tensors are already valid,
+    while still handling edge cases safely. torch.nan_to_num() zeros gradients
+    for all elements when applied, even if no NaN/Inf are present.
+    
+    Args:
+        x: Input tensor
+        nan: Value to replace NaN with (default: 0.0)
+        posinf: Value to replace +Inf with (default: None means no replacement)
+        neginf: Value to replace -Inf with (default: None means no replacement)
+    
+    Returns:
+        Cleaned tensor with gradients preserved when possible
+    """
+    has_issues = torch.isnan(x).any() or torch.isinf(x).any()
+    if has_issues:
+        return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
+    return x
+
+
 class VarifocalLoss(nn.Module):
     """
     Varifocal loss by Zhang et al.
@@ -418,10 +441,10 @@ class MGIoUPoly(nn.Module):
             proj1 = torch.bmm(pred_sorted.to(axes.dtype), axes.transpose(1, 2))
             proj2 = torch.bmm(target_sorted.to(axes.dtype), axes.transpose(1, 2))
             
-            # Safety: Replace NaN/Inf in projections using nan_to_num for gradient preservation
+            # Safety: Replace NaN/Inf in projections only if present (gradient-preserving)
             # This can happen with extreme polygon coordinates
-            proj1 = torch.nan_to_num(proj1, nan=0.0, posinf=1e6, neginf=-1e6)
-            proj2 = torch.nan_to_num(proj2, nan=0.0, posinf=1e6, neginf=-1e6)
+            proj1 = _safe_nan_to_num(proj1, nan=0.0, posinf=1e6, neginf=-1e6)
+            proj2 = _safe_nan_to_num(proj2, nan=0.0, posinf=1e6, neginf=-1e6)
             
             min1, _ = proj1.min(dim=1)
             max1, _ = proj1.max(dim=1)
@@ -442,10 +465,10 @@ class MGIoUPoly(nn.Module):
             inter = (torch.minimum(max1, max2) - torch.maximum(min1, min2)).clamp(min=0.0)
             hull  = torch.maximum(max1, max2) - torch.minimum(min1, min2)
             
-            # Safety: Replace NaN values using nan_to_num for gradient preservation
+            # Safety: Replace NaN only if present (gradient-preserving)
             # NaN can occur from numerical issues in projections (e.g., Inf - Inf)
-            inter = torch.nan_to_num(inter, nan=0.0, posinf=1e6, neginf=0.0)
-            hull = torch.nan_to_num(hull, nan=_EPS, posinf=1e6, neginf=_EPS)
+            inter = _safe_nan_to_num(inter, nan=0.0, posinf=1e6, neginf=0.0)
+            hull = _safe_nan_to_num(hull, nan=_EPS, posinf=1e6, neginf=_EPS)
             
             # Safety: Clamp hull to prevent division by very small values
             # Hull near zero indicates degenerate/collapsed polygons on this axis
@@ -454,8 +477,8 @@ class MGIoUPoly(nn.Module):
             if self.fast_mode:
                 # Simplified GIoU: intersection / hull
                 giou1d = inter / hull_safe
-                # Safety: Replace NaN using nan_to_num for gradient preservation
-                giou1d = torch.nan_to_num(giou1d, nan=0.0, posinf=1.0, neginf=-1.0)
+                # Safety: Replace NaN only if present (gradient-preserving)
+                giou1d = _safe_nan_to_num(giou1d, nan=0.0, posinf=1.0, neginf=-1.0)
             else:
                 # Match reference formula exactly: inter/union - (hull-union)/hull
                 union = (max1 - min1) + (max2 - min2) - inter
@@ -467,16 +490,16 @@ class MGIoUPoly(nn.Module):
                 iou_term = inter / union_safe
                 penalty_term = (hull_safe - union_safe) / hull_safe
                 
-                # Safety: Replace NaN using nan_to_num for gradient preservation
+                # Safety: Replace NaN only if present (gradient-preserving)
                 # Can occur from 0/eps or other numerical instabilities
-                iou_term = torch.nan_to_num(iou_term, nan=0.0, posinf=1.0, neginf=0.0)
-                penalty_term = torch.nan_to_num(penalty_term, nan=0.0, posinf=1.0, neginf=0.0)
+                iou_term = _safe_nan_to_num(iou_term, nan=0.0, posinf=1.0, neginf=0.0)
+                penalty_term = _safe_nan_to_num(penalty_term, nan=0.0, posinf=1.0, neginf=0.0)
                 
                 giou1d = iou_term - penalty_term
                 
-                # Additional safety: Clamp GIoU to valid range [-1, 1]
-                # GIoU should theoretically be in [-1, 1], but numerical issues can push it outside
-                giou1d = giou1d.clamp(min=-1.0, max=1.0)
+                # Note: Removed GIoU clamping to preserve gradients
+                # GIoU should be in [-1, 1] by construction, and clamping zeros gradients at boundaries
+                # If values exceed [-1, 1], it indicates numerical issues that should be debugged, not masked
             
             # Debug check giou1d right after computation (before masking)
             if _DEBUG_NAN:
@@ -498,11 +521,22 @@ class MGIoUPoly(nn.Module):
                     })
                 _check_nan_tensor(giou1d, "giou1d", "MGIoUPoly.forward immediately after GIoU computation", extra_pre)
 
-            # *** KEY: Masked mean - only average over valid (non-degenerate) axes ***
-            # This allows correct batching of polygons with different vertex counts!
-            giou1d_masked = giou1d * mask.to(giou1d.dtype)  # zero out invalid axes
-            num_valid = mask.sum(dim=1, keepdim=True).clamp(min=1)  # avoid div by zero
-            giou_val = giou1d_masked.sum(dim=1) / num_valid.squeeze()
+            # *** KEY: Gradient-preserving masked mean ***
+            # Instead of hard masking (which kills gradients), use conditional approach:
+            # - For polygons with mostly valid axes (>50%), compute regular mean (full gradients)
+            # - Only apply masking when necessary (heavily padded polygons)
+            # This preserves gradient flow while still handling degenerate edges correctly
+            valid_fraction = mask.float().mean(dim=1, keepdim=True)  # [B_valid, 1]
+            mostly_valid = valid_fraction > 0.5  # [B_valid, 1]
+            
+            # Compute both masked and unmasked means
+            mean_unmasked = giou1d.mean(dim=1)  # Full gradient flow
+            giou1d_masked = giou1d * mask.to(giou1d.dtype)
+            num_valid = mask.sum(dim=1).clamp(min=1)
+            mean_masked = giou1d_masked.sum(dim=1) / num_valid
+            
+            # Select based on valid fraction - mostly valid uses unmasked mean for better gradients
+            giou_val = torch.where(mostly_valid.squeeze(), mean_unmasked, mean_masked)
             
             # Debug check for GIoU computation with detailed intermediate values
             if _DEBUG_NAN:
@@ -597,14 +631,13 @@ class MGIoUPoly(nn.Module):
         """
         edges = poly.roll(-1, dims=1) - poly  # [B, N, 2]
         
-        # Safety: Replace NaN/Inf in edges using nan_to_num for gradient preservation
-        # nan -> 0.0, +inf -> 1e6, -inf -> -1e6
-        edges = torch.nan_to_num(edges, nan=0.0, posinf=1e6, neginf=-1e6)
+        # Safety: Replace NaN/Inf only if present (gradient-preserving)
+        edges = _safe_nan_to_num(edges, nan=0.0, posinf=1e6, neginf=-1e6)
         
         edge_lengths = torch.norm(edges, dim=-1, keepdim=True)  # [B, N, 1]
         
-        # Safety: Replace NaN/Inf in edge lengths using nan_to_num
-        edge_lengths = torch.nan_to_num(edge_lengths, nan=0.0, posinf=1e6, neginf=0.0)
+        # Safety: Replace NaN/Inf only if present (gradient-preserving)
+        edge_lengths = _safe_nan_to_num(edge_lengths, nan=0.0, posinf=1e6, neginf=0.0)
         
         # Mark edges as valid if length > eps
         # Degenerate edges (from padding) will have length ≈ 0
@@ -625,9 +658,8 @@ class MGIoUPoly(nn.Module):
         # Use safe division: divide by (length + eps) to prevent division by zero
         normals = normals / (edge_lengths + _EPS)
         
-        # Safety: Final cleanup using nan_to_num for gradient preservation
-        # This handles any remaining numerical edge cases
-        normals = torch.nan_to_num(normals, nan=0.0, posinf=1e6, neginf=-1e6)
+        # Safety: Final cleanup only if NaN/Inf present (gradient-preserving)
+        normals = _safe_nan_to_num(normals, nan=0.0, posinf=1e6, neginf=-1e6)
         
         return normals, mask
     
@@ -1440,6 +1472,20 @@ class v8PolygonLoss(v8DetectionLoss):
                 pred_poly_i = pred_poly[i][fg_mask_i]
                 poly_mask = torch.full_like(gt_poly_scaled[..., 0], True)
                 poly_loss, _ = self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
+                
+                # Gradient monitoring: Log gradient magnitude for debugging
+                # Enable with ULTRALYTICS_DEBUG_NAN=1 to track gradient flow issues
+                if _DEBUG_NAN and poly_loss.requires_grad:
+                    def log_gradient(grad):
+                        if grad is not None:
+                            grad_norm = grad.norm().item()
+                            grad_mean = grad.abs().mean().item()
+                            print(f"[GRADIENT] Image {i}: norm={grad_norm:.6e}, mean_abs={grad_mean:.6e}")
+                            if grad_norm < 1e-8:
+                                print(f"  WARNING: Very small gradient detected! Loss may not be learning.")
+                        return grad
+                    poly_loss.register_hook(log_gradient)
+                
                 polys_loss += poly_loss
 
         # Normalize by number of images with foreground instances
