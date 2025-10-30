@@ -1420,10 +1420,12 @@ class v8PolygonLoss(v8DetectionLoss):
         """
         batch_idx = batch_idx.flatten()
         polys_loss = torch.zeros(1, device=self.device)
+        num_images_with_fg = 0
 
         for i in range(pred_poly.shape[0]):
             fg_mask_i = masks[i]
             if fg_mask_i.sum():
+                num_images_with_fg += 1
                 target_gt_idx_i = target_gt_idx[i][fg_mask_i]
                 gt_matching_bs = batch_idx[target_gt_idx_i].long()
                 gt_poly_scaled = gt_poly[gt_matching_bs]
@@ -1439,6 +1441,12 @@ class v8PolygonLoss(v8DetectionLoss):
                 poly_mask = torch.full_like(gt_poly_scaled[..., 0], True)
                 poly_loss, _ = self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
                 polys_loss += poly_loss
+
+        # Normalize by number of images with foreground instances
+        # This ensures loss doesn't scale linearly with batch size
+        # The final loss * batch_size multiplication at return (line 1380) will then give correct scaling
+        if num_images_with_fg > 0:
+            polys_loss = polys_loss / num_images_with_fg
 
         return polys_loss
 
