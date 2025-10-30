@@ -450,6 +450,13 @@ class Polygon(Detect):
 
         c4 = max(ch[0] // 4, self.npoly)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.npoly, 1)) for x in ch)
+        self.bias_init()
+
+    def bias_init(self):
+        """Initialize Polygon head biases and weights to safe values."""
+        for m in self.cv4:
+            nn.init.constant_(m[-1].weight, 0.0)
+            nn.init.constant_(m[-1].bias, 0.0)
 
     def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
         """Perform forward pass through YOLO model and return predictions."""
