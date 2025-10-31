@@ -210,6 +210,9 @@ class AutoBackend(nn.Module):
             # Common PyTorch model processing
             if hasattr(model, "kpt_shape"):
                 kpt_shape = model.kpt_shape  # pose-only
+            polygon_np = None
+            if hasattr(model, "np"):
+                polygon_np = model.np  # polygon-only
             stride = max(int(model.stride.max()), 32)  # model stride
             names = model.module.names if hasattr(model, "module") else model.names  # get class names
             model.half() if fp16 else model.float()
@@ -583,7 +586,7 @@ class AutoBackend(nn.Module):
             metadata = YAML.load(metadata)
         if metadata and isinstance(metadata, dict):
             for k, v in metadata.items():
-                if k in {"stride", "batch", "channels"}:
+                if k in {"stride", "batch", "channels", "np"}:
                     metadata[k] = int(v)
                 elif k in {"imgsz", "names", "kpt_shape", "args"} and isinstance(v, str):
                     metadata[k] = eval(v)
@@ -593,6 +596,7 @@ class AutoBackend(nn.Module):
             imgsz = metadata["imgsz"]
             names = metadata["names"]
             kpt_shape = metadata.get("kpt_shape")
+            polygon_np = metadata.get("np")
             end2end = metadata.get("args", {}).get("nms", False)
             dynamic = metadata.get("args", {}).get("dynamic", dynamic)
             ch = metadata.get("channels", 3)
@@ -605,6 +609,10 @@ class AutoBackend(nn.Module):
         names = check_class_names(names)
 
         self.__dict__.update(locals())  # assign all variables to self
+        
+        # Set polygon np attribute if available (avoiding conflict with numpy np)
+        if "polygon_np" in locals() and polygon_np is not None:
+            self.np = polygon_np
 
     def forward(
         self,

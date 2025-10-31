@@ -73,7 +73,20 @@ class PolygonPredictor(DetectionPredictor):
         """
         result = super().construct_result(pred, img, orig_img, img_path)
         # Extract keypoints from prediction and reshape according to model's keypoint shape
-        pred_kpts = pred[:, 6:].view(pred.shape[0], *self.model.np)
+        # Get np from model, handling both PyTorch models and AutoBackend models
+        np_val = getattr(self.model, "np", None)
+        if np_val is None:
+            # If not available from model, try to infer from prediction shape
+            # Prediction shape is [N, 6 + K*D], where 6 is bbox+conf+cls, K is num points, D is dimensions (2 for x,y)
+            remaining_features = pred.shape[1] - 6
+            if remaining_features > 0:
+                # Assume 2D points (x, y)
+                np_val = [remaining_features // 2, 2]
+            else:
+                LOGGER.warning(f"Could not determine polygon shape from model or prediction, using default [4, 2]")
+                np_val = [4, 2]
+        
+        pred_kpts = pred[:, 6:].view(pred.shape[0], *np_val)
         # Scale keypoints coordinates to match the original image dimensions
         pred_kpts = ops.scale_coords(img.shape[2:], pred_kpts, orig_img.shape)
         result.update(keypoints=pred_kpts)
