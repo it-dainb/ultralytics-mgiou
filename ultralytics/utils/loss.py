@@ -864,6 +864,15 @@ class PolygonLoss(nn.Module):
         self.l2_loss_ema = 1.0
         self.mgiou_loss_ema = 1.0
         self.ema_decay = 0.9
+        
+        # Log initialization for debugging
+        if use_hybrid:
+            print(f"[HYBRID INIT] PolygonLoss initialized in HYBRID mode:")
+            print(f"  - alpha_schedule: {alpha_schedule}")
+            print(f"  - alpha_start: {alpha_start} (L2 weight)")
+            print(f"  - alpha_end: {alpha_end} (L2 weight)")
+            print(f"  - total_epochs: {total_epochs}")
+            print(f"  - Initial EMA values: L2={self.l2_loss_ema}, MGIoU={self.mgiou_loss_ema}")
 
     def get_alpha(self, epoch: int = None) -> float:
         """
@@ -998,10 +1007,11 @@ class PolygonLoss(nn.Module):
             combined_normalized = alpha * l2_normalized + (1 - alpha) * mgiou_normalized
             total_loss = combined_normalized * self.l2_loss_ema
             
-            # Debug info
+            # Enhanced debug info - log EVERY call when debug is enabled to diagnose epoch issues
             if _DEBUG_NAN:
-                print(f"[HYBRID] Epoch {self.current_epoch}: alpha={alpha:.3f}, "
+                print(f"[HYBRID] current_epoch={self.current_epoch}, passed_epoch={epoch}, alpha={alpha:.3f}, "
                       f"L2={l2_loss.item():.4f}, MGIoU={mgiou_loss.item():.4f}, "
+                      f"L2_EMA={self.l2_loss_ema:.4f}, MGIoU_EMA={self.mgiou_loss_ema:.4f}, "
                       f"L2_norm={l2_normalized.item():.4f}, MGIoU_norm={mgiou_normalized.item():.4f}, "
                       f"total={total_loss.item():.4f}")
             
@@ -1497,6 +1507,13 @@ class v8PolygonLoss(v8DetectionLoss):
         """Set current epoch for hybrid loss scheduling."""
         self.current_epoch = epoch
         self.polygon_loss.current_epoch = epoch
+        
+        # Log epoch updates for debugging
+        if self.use_hybrid:
+            alpha = self.polygon_loss.get_alpha()
+            print(f"[HYBRID] v8PolygonLoss.set_epoch({epoch}): "
+                  f"alpha={alpha:.4f}, L2_EMA={self.polygon_loss.l2_loss_ema:.4f}, "
+                  f"MGIoU_EMA={self.polygon_loss.mgiou_loss_ema:.4f}")
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         loss = torch.zeros(5, device=self.device)

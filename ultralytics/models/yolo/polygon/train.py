@@ -150,8 +150,40 @@ class PolygonTrainer(yolo.detect.DetectionTrainer):
         """Called at the start of each training epoch to update loss function's epoch counter."""
         super().on_train_epoch_start() if hasattr(super(), 'on_train_epoch_start') else None
         
+        # Debug: Check model structure
+        if self.use_hybrid and self.epoch == 0:
+            print(f"[HYBRID DEBUG] Checking model structure:")
+            print(f"  - self.model type: {type(self.model)}")
+            print(f"  - has criterion: {hasattr(self.model, 'criterion')}")
+            if hasattr(self.model, 'criterion'):
+                print(f"  - criterion type: {type(self.model.criterion)}")
+                print(f"  - has set_epoch: {hasattr(self.model.criterion, 'set_epoch')}")
+            # Check if wrapped in DDP
+            if hasattr(self.model, 'module'):
+                print(f"  - model.module type: {type(self.model.module)}")
+                print(f"  - module.criterion exists: {hasattr(self.model.module, 'criterion')}")
+        
         # Update epoch in loss function for hybrid scheduling
-        if hasattr(self.model, 'criterion') and hasattr(self.model.criterion, 'set_epoch'):
-            self.model.criterion.set_epoch(self.epoch)
+        # Handle both regular and DDP-wrapped models
+        criterion = None
+        if hasattr(self.model, 'criterion'):
+            criterion = self.model.criterion
+        elif hasattr(self.model, 'module') and hasattr(self.model.module, 'criterion'):
+            criterion = self.model.module.criterion
+        
+        if criterion and hasattr(criterion, 'set_epoch'):
+            print(f"[HYBRID] Calling set_epoch({self.epoch}) on criterion")
+            criterion.set_epoch(self.epoch)
+            
+            # Log alpha progression for hybrid mode
+            if self.use_hybrid and hasattr(criterion, 'polygon_loss'):
+                alpha = criterion.polygon_loss.get_alpha()
+                print(f"[HYBRID] Starting Epoch {self.epoch}/{self.epochs}: alpha={alpha:.4f} "
+                      f"(L2 weight={alpha:.2%}, MGIoU weight={1-alpha:.2%})")
+        else:
+            print(f"[HYBRID WARNING] Could not find criterion or set_epoch method!")
+            print(f"  - self.model type: {type(self.model)}")
+            print(f"  - criterion found: {criterion is not None}")
+            print(f"  - has set_epoch: {criterion and hasattr(criterion, 'set_epoch')}")
 
 
