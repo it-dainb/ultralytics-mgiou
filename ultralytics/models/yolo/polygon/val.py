@@ -86,6 +86,38 @@ class PolygonValidator(DetectionValidator):
                 "See https://github.com/ultralytics/ultralytics/issues/4031."
             )
 
+    def get_dataloader(self, dataset_path: str, batch_size: int):
+        """Construct and return dataloader, ensuring np field is populated in data dict."""
+        dataloader = super().get_dataloader(dataset_path, batch_size)
+        # Ensure np is in self.data for polygon validation
+        if self.data and "np" not in self.data:
+            self._populate_np_from_model()
+        return dataloader
+
+    def _populate_np_from_model(self):
+        """Populate the np field in self.data from model configuration if missing."""
+        from ultralytics.nn.tasks import yaml_model_load
+        
+        # Try to get np from model if we have it loaded
+        if hasattr(self, 'model') and hasattr(self.model, 'np'):
+            self.data["np"] = self.model.np
+            LOGGER.info(f"Using np={self.model.np} from loaded model")
+        # Try to get from model file
+        elif self.args.model:
+            try:
+                if not isinstance(self.args.model, dict):
+                    model_cfg = yaml_model_load(self.args.model)
+                else:
+                    model_cfg = self.args.model
+                
+                if "np" in model_cfg:
+                    self.data["np"] = model_cfg["np"]
+                    LOGGER.info(f"Using np={model_cfg['np']} from model configuration")
+            except Exception as e:
+                LOGGER.debug(f"Could not load np from model config: {e}")
+        
+        # If still not found, we'll handle it in init_metrics with a default
+
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch by converting polygon data to float and moving it to the device."""
         batch = super().preprocess(batch)
@@ -117,7 +149,20 @@ class PolygonValidator(DetectionValidator):
             model (torch.nn.Module): Model to validate.
         """
         super().init_metrics(model)
-        self.np = self.data["np"]
+        
+        # Try to get np from data first, then from model, with a sensible default
+        if "np" in self.data:
+            self.np = self.data["np"]
+        elif hasattr(model, "np"):
+            self.np = model.np
+        else:
+            # Try to infer from model config
+            if hasattr(model, "yaml") and "np" in model.yaml:
+                self.np = model.yaml["np"]
+            else:
+                LOGGER.warning("Could not determine polygon vertex count (np). Using default value of 4.")
+                self.np = 4
+        
         # For polygon task, np is just an integer (number of points)
         # For pose task, it would be a list like [17, 3]
         is_pose = isinstance(self.np, list) and self.np == [17, 3]
