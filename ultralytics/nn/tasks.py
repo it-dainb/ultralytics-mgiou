@@ -638,7 +638,9 @@ class PolygonModel(DetectionModel):
         >>> results = model.predict(image_tensor)
     """
 
-    def __init__(self, cfg="yolo11n-polygon.yaml", ch=3, nc=None, data_np=3, verbose=True, use_mgiou=False):
+    def __init__(self, cfg="yolo11n-polygon.yaml", ch=3, nc=None, data_np=3, verbose=True, 
+                 use_mgiou=False, use_hybrid=False, alpha_schedule="cosine", 
+                 alpha_start=0.9, alpha_end=0.2, total_epochs=100):
         """
         Initialize Ultralytics YOLO Polygon model.
 
@@ -649,6 +651,11 @@ class PolygonModel(DetectionModel):
             data_np (tuple): Number of polygon points data.
             verbose (bool): Whether to display model information.
             use_mgiou (bool): Whether to use MGIoU loss.
+            use_hybrid (bool): Whether to use hybrid L2+MGIoU loss with scheduling.
+            alpha_schedule (str): Schedule type for alpha weight ("cosine", "linear", "step").
+            alpha_start (float): Initial alpha value (L2 weight).
+            alpha_end (float): Final alpha value (L2 weight).
+            total_epochs (int): Total training epochs for scheduling.
         """
         if not isinstance(cfg, dict):
             cfg = yaml_model_load(cfg)  # load model YAML
@@ -657,10 +664,23 @@ class PolygonModel(DetectionModel):
             cfg["np"] = data_np
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.use_mgiou = use_mgiou
+        self.use_hybrid = use_hybrid
+        self.alpha_schedule = alpha_schedule
+        self.alpha_start = alpha_start
+        self.alpha_end = alpha_end
+        self.total_epochs = total_epochs
 
     def init_criterion(self):
         """Initialize the loss criterion for the PolygonModel."""
-        return v8PolygonLoss(self, use_mgiou=self.use_mgiou)
+        return v8PolygonLoss(
+            self, 
+            use_mgiou=self.use_mgiou,
+            use_hybrid=self.use_hybrid,
+            alpha_schedule=self.alpha_schedule,
+            alpha_start=self.alpha_start,
+            alpha_end=self.alpha_end,
+            total_epochs=self.total_epochs
+        )
 
 
 class ClassificationModel(BaseModel):

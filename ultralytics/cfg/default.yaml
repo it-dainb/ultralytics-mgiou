@@ -38,7 +38,11 @@ profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first N layers (int) or specific layer indices (list)
 multi_scale: False # (bool) multiscale training by varying image size
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
-use_mgiou: False # (bool) Whether to use mgiou during training obb model, it is recommended to set this parameter to True.
+use_mgiou: False # (bool) Whether to use mgiou during training obb/polygon model, it is recommended to set this parameter to True.
+use_hybrid: False # (bool) Use hybrid L2+MGIoU loss with dynamic scheduling for polygon training (recommended for best results)
+alpha_schedule: cosine # (str) Schedule type for hybrid loss alpha weight: "cosine", "linear", or "step"
+alpha_start: 0.9 # (float) Initial alpha value (L2 weight) for hybrid loss, range [0,1]
+alpha_end: 0.2 # (float) Final alpha value (L2 weight) for hybrid loss, range [0,1]
 
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)

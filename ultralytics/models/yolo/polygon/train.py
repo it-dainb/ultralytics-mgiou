@@ -55,7 +55,13 @@ class PolygonTrainer(yolo.detect.DetectionTrainer):
             overrides = {}
         overrides["task"] = "polygon"
         super().__init__(cfg, overrides, _callbacks)
+        
+        # Extract hybrid loss parameters from overrides
         self.use_mgiou = overrides.get("use_mgiou", False)
+        self.use_hybrid = overrides.get("use_hybrid", False)
+        self.alpha_schedule = overrides.get("alpha_schedule", "cosine")
+        self.alpha_start = overrides.get("alpha_start", 0.9)
+        self.alpha_end = overrides.get("alpha_end", 0.2)
 
         if isinstance(self.args.device, str) and self.args.device.lower() == "mps":
             LOGGER.warning(
@@ -81,7 +87,17 @@ class PolygonTrainer(yolo.detect.DetectionTrainer):
             (PolygonModel): Initialized pose estimation model.
         """
         model = PolygonModel(
-            cfg, nc=self.data["nc"], ch=self.data["channels"], data_np=self.data["np"], verbose=verbose, use_mgiou=self.use_mgiou
+            cfg, 
+            nc=self.data["nc"], 
+            ch=self.data["channels"], 
+            data_np=self.data["np"], 
+            verbose=verbose, 
+            use_mgiou=self.use_mgiou,
+            use_hybrid=self.use_hybrid,
+            alpha_schedule=self.alpha_schedule,
+            alpha_start=self.alpha_start,
+            alpha_end=self.alpha_end,
+            total_epochs=self.epochs
         )
         if weights:
             model.load(weights)
@@ -129,3 +145,13 @@ class PolygonTrainer(yolo.detect.DetectionTrainer):
                     f"Please specify the number of polygon points in your model or dataset YAML."
                 )
         return data
+    
+    def on_train_epoch_start(self):
+        """Called at the start of each training epoch to update loss function's epoch counter."""
+        super().on_train_epoch_start() if hasattr(super(), 'on_train_epoch_start') else None
+        
+        # Update epoch in loss function for hybrid scheduling
+        if hasattr(self.model, 'criterion') and hasattr(self.model.criterion, 'set_epoch'):
+            self.model.criterion.set_epoch(self.epoch)
+
+

@@ -489,6 +489,7 @@ class Polygon(Detect):
         y = torch.clamp(y, min=-50.0, max=50.0)
         
         # Decode (x, y) coordinates relative to anchor grid and strides
+        # Using same formula as Pose head (kpts_decode) - both predict coordinate points
         y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
         y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
         

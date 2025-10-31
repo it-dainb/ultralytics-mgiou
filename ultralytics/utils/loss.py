@@ -795,9 +795,10 @@ class PolygonLoss(nn.Module):
     """
     Criterion class for computing polygon losses using MGIoU or L2 distance.
     
-    This loss supports two modes:
-    1. MGIoU mode (use_mgiou=True): Uses MGIoUPoly for geometry-aware loss
-    2. L2 mode (use_mgiou=False): Uses normalized L2 distance with area weighting
+    This loss supports three modes:
+    1. MGIoU mode (use_mgiou=True, use_hybrid=False): Uses MGIoUPoly for geometry-aware loss
+    2. L2 mode (use_mgiou=False, use_hybrid=False): Uses normalized L2 distance with area weighting
+    3. Hybrid mode (use_hybrid=True): Combines L2 and MGIoU with dynamic scheduling
     
     NaN Prevention (L2 Mode):
     - Area values are clamped to minimum 1e-6 to prevent division by very small numbers
@@ -808,66 +809,205 @@ class PolygonLoss(nn.Module):
     - Inherits all NaN prevention mechanisms from MGIoUPoly class
     - See MGIoUPoly documentation for detailed safety features
     
+    Hybrid Mode:
+    - Combines L2 (strong gradients) and MGIoU (geometric awareness)
+    - Uses dynamic weight scheduling (alpha: high→low) over training epochs
+    - Early training: L2 dominates (strong gradients, escape local minima)
+    - Late training: MGIoU dominates (geometric refinement)
+    
     Debugging:
-    - Set ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks in both modes
+    - Set ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks in all modes
     """
 
-    def __init__(self, use_mgiou: bool = False) -> None:
-        """Initialize the PolygonLoss class with optional MGIoU loss."""
-        super().__init__()  # dummy sigma, not used
-        self.mgiou_loss = MGIoUPoly(reduction="mean") if use_mgiou else None
+    def __init__(
+        self, 
+        use_mgiou: bool = False,
+        use_hybrid: bool = False,
+        alpha_schedule: str = "cosine",
+        alpha_start: float = 0.9,
+        alpha_end: float = 0.2,
+        total_epochs: int = 100
+    ) -> None:
+        """
+        Initialize the PolygonLoss class with optional MGIoU or hybrid loss.
+        
+        Args:
+            use_mgiou: Use pure MGIoU loss (not recommended from scratch)
+            use_hybrid: Use hybrid L2+MGIoU loss with scheduling
+            alpha_schedule: Schedule type for alpha weight ("cosine", "linear", "step")
+            alpha_start: Initial alpha value (L2 weight), default 0.9
+            alpha_end: Final alpha value (L2 weight), default 0.2
+            total_epochs: Total training epochs for scheduling
+        """
+        super().__init__()
+        
+        # Hybrid mode takes precedence over use_mgiou
+        if use_hybrid:
+            self.mode = "hybrid"
+            self.mgiou_loss = MGIoUPoly(reduction="mean")
+        elif use_mgiou:
+            self.mode = "mgiou"
+            self.mgiou_loss = MGIoUPoly(reduction="mean")
+        else:
+            self.mode = "l2"
+            self.mgiou_loss = None
+        
+        # Hybrid mode settings
+        self.use_hybrid = use_hybrid
+        self.alpha_schedule = alpha_schedule
+        self.alpha_start = alpha_start
+        self.alpha_end = alpha_end
+        self.total_epochs = total_epochs
+        self.current_epoch = 0
+        
+        # Track gradient magnitudes for normalization (EMA)
+        self.l2_loss_ema = 1.0
+        self.mgiou_loss_ema = 1.0
+        self.ema_decay = 0.9
+
+    def get_alpha(self, epoch: int = None) -> float:
+        """
+        Get current alpha value based on epoch and schedule.
+        
+        Args:
+            epoch: Current epoch number (if None, uses self.current_epoch)
+            
+        Returns:
+            Alpha value (L2 weight) between alpha_start and alpha_end
+        """
+        if epoch is not None:
+            self.current_epoch = epoch
+            
+        if self.total_epochs <= 0:
+            return self.alpha_start
+            
+        # For epoch-based scheduling: epoch 0-99 over 100 epochs means progress 0.0-0.99
+        # At the final epoch (epoch 99), we should reach alpha_end
+        progress = min(self.current_epoch / (self.total_epochs - 1), 1.0) if self.total_epochs > 1 else 1.0
+        
+        if self.alpha_schedule == "cosine":
+            # Cosine annealing: smooth transition
+            import math
+            alpha = self.alpha_end + 0.5 * (self.alpha_start - self.alpha_end) * \
+                    (1 + math.cos(math.pi * progress))
+        elif self.alpha_schedule == "linear":
+            # Linear decay
+            alpha = self.alpha_start - (self.alpha_start - self.alpha_end) * progress
+        elif self.alpha_schedule == "step":
+            # Step decay at 50% and 75%
+            if progress < 0.5:
+                alpha = self.alpha_start
+            elif progress < 0.75:
+                alpha = (self.alpha_start + self.alpha_end) / 2
+            else:
+                alpha = self.alpha_end
+        else:
+            # Default to cosine
+            import math
+            alpha = self.alpha_end + 0.5 * (self.alpha_start - self.alpha_end) * \
+                    (1 + math.cos(math.pi * progress))
+            
+        return alpha
 
     def forward(
-        self, pred_kpts: torch.Tensor, gt_kpts: torch.Tensor, kpt_mask: torch.Tensor, area: torch.Tensor
+        self, 
+        pred_kpts: torch.Tensor, 
+        gt_kpts: torch.Tensor, 
+        kpt_mask: torch.Tensor, 
+        area: torch.Tensor,
+        epoch: int = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Calculate polygon loss using MGIoU or fallback to L2 distance.
+        Calculate polygon loss using MGIoU, L2, or hybrid mode.
         
         Args:
             pred_kpts: Predicted polygon vertices, shape (N, num_vertices, 2 or 3)
             gt_kpts: Ground truth polygon vertices, shape (N, num_vertices, 2 or 3)
             kpt_mask: Mask indicating valid vertices, shape (N, num_vertices)
             area: Area of bounding boxes, shape (N, 1)
+            epoch: Current epoch (for hybrid mode scheduling)
             
         Returns:
-            Tuple of (total_loss, mgiou_loss) where mgiou_loss is 0 if not using MGIoU
+            Tuple of (total_loss, mgiou_loss_component)
+            - For L2 mode: (l2_loss, 0)
+            - For MGIoU mode: (mgiou_loss, mgiou_loss)
+            - For Hybrid mode: (weighted_loss, mgiou_loss_component)
             
         Note:
             Set environment variable ULTRALYTICS_DEBUG_NAN=1 to enable runtime NaN checks.
         """
+        # Update epoch for hybrid mode
+        if epoch is not None and self.use_hybrid:
+            self.current_epoch = epoch
+        
         # Debug checks for inputs
         _check_nan_tensor(pred_kpts, "pred_kpts", "PolygonLoss.forward input")
         _check_nan_tensor(gt_kpts, "gt_kpts", "PolygonLoss.forward input")
         _check_nan_tensor(area, "area", "PolygonLoss.forward input")
         
-        if self.mgiou_loss:
-            pred_poly = pred_kpts[..., :2]
-            gt_poly = gt_kpts[..., :2]
-            
-            weights = area.squeeze(-1)
-            
-            # MGIoUPoly already returns scalar with reduction='mean', no need for additional .mean()
-            total_loss = self.mgiou_loss(pred_poly, gt_poly, weight=weights)
-            
-            # Debug check for output
-            _check_nan_tensor(total_loss, "total_loss (mgiou)", "PolygonLoss.forward output")
-            
-            return total_loss, total_loss
-        else:
-            d = (pred_kpts[..., 0] - gt_kpts[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_kpts[..., 1]).pow(2)
-            kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
-            
-            # Clamp area to prevent division by very small numbers that can cause numerical instability
-            area_safe = area.clamp(min=1e-6)
-            e = d / (area_safe + 1e-9)
-            
-            l2_loss = (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
+        # === Compute L2 Loss (always computed for hybrid mode) ===
+        d = (pred_kpts[..., 0] - gt_kpts[..., 0]).pow(2) + (pred_kpts[..., 1] - gt_kpts[..., 1]).pow(2)
+        kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
+        
+        # Clamp area to prevent division by very small numbers
+        area_safe = area.clamp(min=1e-6)
+        # Expand area to match d's shape [batch, n_points]
+        e = d / (area_safe.unsqueeze(1) + 1e-9)
+        
+        l2_loss = (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
+        
+        # Debug check
+        _check_nan_tensor(l2_loss, "l2_loss", "PolygonLoss.forward L2 component")
+        
+        # === Pure L2 Mode ===
+        if self.mode == "l2":
             mgiou_loss = torch.tensor(0.0).to(pred_kpts.device)
-            
-            # Debug check for output
-            _check_nan_tensor(l2_loss, "l2_loss", "PolygonLoss.forward output")
-            
             return l2_loss, mgiou_loss
+        
+        # === Compute MGIoU Loss (for MGIoU or Hybrid mode) ===
+        pred_poly = pred_kpts[..., :2]
+        gt_poly = gt_kpts[..., :2]
+        weights = area.squeeze(-1)
+        
+        mgiou_loss = self.mgiou_loss(pred_poly, gt_poly, weight=weights)
+        
+        # Debug check
+        _check_nan_tensor(mgiou_loss, "mgiou_loss", "PolygonLoss.forward MGIoU component")
+        
+        # === Pure MGIoU Mode ===
+        if self.mode == "mgiou":
+            return mgiou_loss, mgiou_loss
+        
+        # === Hybrid Mode ===
+        if self.mode == "hybrid":
+            # Get current alpha (L2 weight)
+            alpha = self.get_alpha(epoch)
+            
+            # Update EMA for loss magnitude tracking
+            with torch.no_grad():
+                self.l2_loss_ema = self.ema_decay * self.l2_loss_ema + (1 - self.ema_decay) * l2_loss.item()
+                self.mgiou_loss_ema = self.ema_decay * self.mgiou_loss_ema + (1 - self.ema_decay) * mgiou_loss.item()
+            
+            # Normalize losses to balance gradient magnitudes
+            # L2 gradients are typically 10-100x stronger than MGIoU gradients
+            l2_scale = 1.0 / (self.l2_loss_ema + 1e-6)
+            mgiou_scale = 1.0 / (self.mgiou_loss_ema + 1e-6)
+            
+            # Combine with scheduling
+            total_loss = alpha * (l2_loss * l2_scale) + (1 - alpha) * (mgiou_loss * mgiou_scale)
+            
+            # Debug info
+            if _DEBUG_NAN:
+                print(f"[HYBRID] Epoch {self.current_epoch}: alpha={alpha:.3f}, "
+                      f"L2={l2_loss.item():.4f}, MGIoU={mgiou_loss.item():.4f}, "
+                      f"L2_scale={l2_scale:.4f}, MGIoU_scale={mgiou_scale:.4f}")
+            
+            _check_nan_tensor(total_loss, "total_loss (hybrid)", "PolygonLoss.forward output")
+            
+            return total_loss, mgiou_loss
+        
+        # Fallback (should never reach here)
+        return l2_loss, mgiou_loss
 
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
@@ -1328,13 +1468,32 @@ class v8PoseLoss(v8DetectionLoss):
 
 class v8PolygonLoss(v8DetectionLoss):
 
-    def __init__(self, model, use_mgiou: bool = False):
+    def __init__(self, model, use_mgiou: bool = False, use_hybrid: bool = False, 
+                 alpha_schedule: str = "cosine", alpha_start: float = 0.9, 
+                 alpha_end: float = 0.2, total_epochs: int = 100):
         super().__init__(model, use_mgiou=use_mgiou)
         self.poly_shape = model.model[-1].poly_shape
         self.bce_poly = nn.BCEWithLogitsLoss()
         npoly = self.poly_shape[0]
-        self.polygon_loss = PolygonLoss(use_mgiou=use_mgiou)
+        
+        # Initialize PolygonLoss with hybrid support
+        self.polygon_loss = PolygonLoss(
+            use_mgiou=use_mgiou,
+            use_hybrid=use_hybrid,
+            alpha_schedule=alpha_schedule,
+            alpha_start=alpha_start,
+            alpha_end=alpha_end,
+            total_epochs=total_epochs
+        )
+        
         self.use_mgiou = use_mgiou
+        self.use_hybrid = use_hybrid
+        self.current_epoch = 0
+    
+    def set_epoch(self, epoch: int):
+        """Set current epoch for hybrid loss scheduling."""
+        self.current_epoch = epoch
+        self.polygon_loss.current_epoch = epoch
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         loss = torch.zeros(5, device=self.device)
@@ -1494,7 +1653,7 @@ class v8PolygonLoss(v8DetectionLoss):
                 area = xyxy2xywh(target_bboxes[i][fg_mask_i])[:, 2:].prod(1, keepdim=True)
                 pred_poly_i = pred_poly[i][fg_mask_i]
                 poly_mask = torch.full_like(gt_poly_scaled[..., 0], True)
-                poly_loss, _ = self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area)
+                poly_loss, _ = self.polygon_loss(pred_poly_i, gt_poly_scaled, poly_mask, area, epoch=self.current_epoch)
                 
                 # Gradient monitoring: Log gradient magnitude for debugging
                 # Enable with ULTRALYTICS_DEBUG_NAN=1 to track gradient flow issues
