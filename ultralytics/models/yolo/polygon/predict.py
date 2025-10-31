@@ -86,6 +86,15 @@ class PolygonPredictor(DetectionPredictor):
                 LOGGER.warning(f"Could not determine polygon shape from model or prediction, using default [4, 2]")
                 np_val = [4, 2]
         
+        # Ensure np_val is a list/tuple for unpacking with *
+        # For polygon models, np is typically an int (num_points), need to convert to [num_points, 2]
+        # For pose models, np is already a list like [17, 3]
+        if isinstance(np_val, int):
+            np_val = [np_val, 2]
+        elif not isinstance(np_val, (list, tuple)):
+            LOGGER.warning(f"Unexpected np type: {type(np_val)}, value: {np_val}. Using default [4, 2]")
+            np_val = [4, 2]
+        
         pred_kpts = pred[:, 6:].view(pred.shape[0], *np_val)
         # Scale keypoints coordinates to match the original image dimensions
         pred_kpts = ops.scale_coords(img.shape[2:], pred_kpts, orig_img.shape)
