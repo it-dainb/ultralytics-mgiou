@@ -988,19 +988,22 @@ class PolygonLoss(nn.Module):
                 self.l2_loss_ema = self.ema_decay * self.l2_loss_ema + (1 - self.ema_decay) * l2_loss.item()
                 self.mgiou_loss_ema = self.ema_decay * self.mgiou_loss_ema + (1 - self.ema_decay) * mgiou_loss.item()
             
-            # Normalize losses to balance gradient magnitudes
-            # L2 gradients are typically 10-100x stronger than MGIoU gradients
-            l2_scale = 1.0 / (self.l2_loss_ema + 1e-6)
-            mgiou_scale = 1.0 / (self.mgiou_loss_ema + 1e-6)
+            # Normalize losses to have similar scales (target scale = 1.0)
+            # This prevents one loss from dominating due to magnitude differences
+            l2_normalized = l2_loss / (self.l2_loss_ema + 1e-6)
+            mgiou_normalized = mgiou_loss / (self.mgiou_loss_ema + 1e-6)
             
-            # Combine with scheduling
-            total_loss = alpha * (l2_loss * l2_scale) + (1 - alpha) * (mgiou_loss * mgiou_scale)
+            # Combine normalized losses with scheduling, then scale back to reasonable range
+            # Use L2 EMA as reference scale to maintain backward compatibility
+            combined_normalized = alpha * l2_normalized + (1 - alpha) * mgiou_normalized
+            total_loss = combined_normalized * self.l2_loss_ema
             
             # Debug info
             if _DEBUG_NAN:
                 print(f"[HYBRID] Epoch {self.current_epoch}: alpha={alpha:.3f}, "
                       f"L2={l2_loss.item():.4f}, MGIoU={mgiou_loss.item():.4f}, "
-                      f"L2_scale={l2_scale:.4f}, MGIoU_scale={mgiou_scale:.4f}")
+                      f"L2_norm={l2_normalized.item():.4f}, MGIoU_norm={mgiou_normalized.item():.4f}, "
+                      f"total={total_loss.item():.4f}")
             
             _check_nan_tensor(total_loss, "total_loss (hybrid)", "PolygonLoss.forward output")
             
