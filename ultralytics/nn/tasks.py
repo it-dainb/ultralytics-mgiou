@@ -1798,17 +1798,19 @@ def yaml_model_load(path):
 
 
 def guess_model_scale(model_path):
-    """
-    Extract the size character n, s, m, l, or x of the model's scale from the model path.
-
-    Args:
-        model_path (str | Path): The path to the YOLO model's YAML file.
-
-    Returns:
-        (str): The size character of the model's scale (n, s, m, l, or x).
-    """
+    """Extract the size character n, s, m, l, or x from the model path."""
     try:
-        return re.search(r"yolo(e-)?[v]?\d+([nslmx])", Path(model_path).stem).group(2)  # noqa
+        # Original pattern for YOLO models
+        match = re.search(r"yolo(e-)?[v]?\d+([nslmx])", Path(model_path).stem)
+        if match:
+            return match.group(2)
+        
+        # New pattern for custom models: any_name_n, any_name_s, etc.
+        match = re.search(r"[-_]([nslmx])(?:[-_.]|$)", Path(model_path).stem)
+        if match:
+            return match.group(1)
+        
+        return ""
     except AttributeError:
         return ""
 
