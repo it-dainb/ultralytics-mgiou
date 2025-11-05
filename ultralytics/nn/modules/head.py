@@ -77,17 +77,18 @@ class Detect(nn.Module):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, ch: tuple = (), cbam_kernel: int | list = None):
+    def __init__(self, nc: int = 80, ch: tuple = (), use_cbam: bool = False, cbam_kernel: int | list = None):
         """
         Initialize the YOLO detection layer with specified number of classes and channels.
 
         Args:
             nc (int): Number of classes.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
-            cbam_kernel (int | list): Kernel size(s) for CBAM spatial attention.
-                - int: Use same kernel for all layers (3, 5, or 7)
-                - list: Specific kernel per layer (e.g., [7, 5, 3] for P3, P4, P5)
-                - None: Auto-adaptive based on feature map scale (P3→7, P4→5, P5→3, etc.)
+            use_cbam (bool): Whether to use CBAM attention in classification head. Default: False.
+            cbam_kernel (int | list): Kernel size(s) for CBAM spatial attention (only used if use_cbam=True).
+                - int: Use same kernel for all layers (3 or 7)
+                - list: Specific kernel per layer (e.g., [7, 7, 3] for P3, P4, P5)
+                - None: Auto-adaptive based on feature map scale (P3→7, P4→7, P5+→3)
         """
         super().__init__()
         self.nc = nc  # number of classes
@@ -95,70 +96,88 @@ class Detect(nn.Module):
         self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
+        self.use_cbam = use_cbam  # store for reference
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
-        
-        # Determine adaptive CBAM kernel sizes based on feature pyramid level
-        # Larger feature maps (P3) → larger kernels for more spatial context
-        # Smaller feature maps (P5+) → smaller kernels for efficiency
-        # Note: CBAM spatial attention only supports kernel sizes 3 or 7
-        if cbam_kernel is None:
-            # Auto-adaptive kernel sizes: alternate between 7 and 3 based on level
-            # P3 (largest) → 7, P4 → 7, P5+ (small) → 3
-            # This provides good context for P3/P4 while being efficient for P5+
-            cbam_kernels = []
-            for i in range(self.nl):
-                # First 2 levels use 7×7 for rich spatial context
-                # Remaining levels use 3×3 for efficiency
-                kernel = 7 if i < 2 else 3
-                cbam_kernels.append(kernel)
-        elif isinstance(cbam_kernel, int):
-            # Fixed kernel size for all layers
-            assert cbam_kernel in {3, 7}, "CBAM kernel_size must be 3 or 7"
-            cbam_kernels = [cbam_kernel] * self.nl
-        else:
-            # User-provided list - validate all are 3 or 7
-            cbam_kernels = list(cbam_kernel) if len(cbam_kernel) == self.nl else [cbam_kernel[0]] * self.nl
-            assert all(k in {3, 7} for k in cbam_kernels), "All CBAM kernel sizes must be 3 or 7"
         
         # Box regression head (unchanged)
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
         
-        # Enhanced classification head with adaptive CBAM attention
-        # Architecture: Conv (expand) -> CBAM (adaptive kernel) -> Conv layers -> Conv2d (classify)
-        c_expand = max(c3 * 2, 256)  # Expanded channel size for better feature extraction
-        self.cv3 = (
-            nn.ModuleList(
-                nn.Sequential(
-                    # Channel expansion for richer features
-                    Conv(x, c_expand, 1, 1),
-                    # CBAM attention with adaptive kernel size (P3→7, P4→5, P5→3)
-                    CBAM(c_expand, kernel_size=cbam_kernels[i]),
-                    # Feature extraction layers
-                    Conv(c_expand, c3, 3),
-                    Conv(c3, c3, 3),
-                    # Final classification layer
-                    nn.Conv2d(c3, self.nc, 1),
-                ) 
-                for i, x in enumerate(ch)
-            )
-            if self.legacy
-            else nn.ModuleList(
-                nn.Sequential(
-                    # Channel expansion for richer features
-                    Conv(x, c_expand, 1, 1),
-                    # CBAM attention with adaptive kernel size (P3→7, P4→5, P5→3)
-                    CBAM(c_expand, kernel_size=cbam_kernels[i]),
-                    # Feature extraction layers with depthwise convolutions
-                    nn.Sequential(DWConv(c_expand, c_expand, 3), Conv(c_expand, c3, 1)),
-                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    # Final classification layer
-                    nn.Conv2d(c3, self.nc, 1),
+        # Classification head - with or without CBAM
+        if use_cbam:
+            # Determine adaptive CBAM kernel sizes based on feature pyramid level
+            # Larger feature maps (P3) → larger kernels for more spatial context
+            # Smaller feature maps (P5+) → smaller kernels for efficiency
+            # Note: CBAM spatial attention only supports kernel sizes 3 or 7
+            if cbam_kernel is None:
+                # Auto-adaptive kernel sizes: alternate between 7 and 3 based on level
+                # P3 (largest) → 7, P4 → 7, P5+ (small) → 3
+                # This provides good context for P3/P4 while being efficient for P5+
+                cbam_kernels = []
+                for i in range(self.nl):
+                    # First 2 levels use 7×7 for rich spatial context
+                    # Remaining levels use 3×3 for efficiency
+                    kernel = 7 if i < 2 else 3
+                    cbam_kernels.append(kernel)
+            elif isinstance(cbam_kernel, int):
+                # Fixed kernel size for all layers
+                assert cbam_kernel in {3, 7}, "CBAM kernel_size must be 3 or 7"
+                cbam_kernels = [cbam_kernel] * self.nl
+            else:
+                # User-provided list - validate all are 3 or 7
+                cbam_kernels = list(cbam_kernel) if len(cbam_kernel) == self.nl else [cbam_kernel[0]] * self.nl
+                assert all(k in {3, 7} for k in cbam_kernels), "All CBAM kernel sizes must be 3 or 7"
+            
+            # Enhanced classification head with adaptive CBAM attention
+            # Architecture: Conv (expand) -> CBAM (adaptive kernel) -> Conv layers -> Conv2d (classify)
+            c_expand = max(c3 * 2, 256)  # Expanded channel size for better feature extraction
+            self.cv3 = (
+                nn.ModuleList(
+                    nn.Sequential(
+                        # Channel expansion for richer features
+                        Conv(x, c_expand, 1, 1),
+                        # CBAM attention with adaptive kernel size (P3→7, P4→7, P5→3)
+                        CBAM(c_expand, kernel_size=cbam_kernels[i]),
+                        # Feature extraction layers
+                        Conv(c_expand, c3, 3),
+                        Conv(c3, c3, 3),
+                        # Final classification layer
+                        nn.Conv2d(c3, self.nc, 1),
+                    ) 
+                    for i, x in enumerate(ch)
                 )
-                for i, x in enumerate(ch)
+                if self.legacy
+                else nn.ModuleList(
+                    nn.Sequential(
+                        # Channel expansion for richer features
+                        Conv(x, c_expand, 1, 1),
+                        # CBAM attention with adaptive kernel size (P3→7, P4→7, P5→3)
+                        CBAM(c_expand, kernel_size=cbam_kernels[i]),
+                        # Feature extraction layers with depthwise convolutions
+                        nn.Sequential(DWConv(c_expand, c_expand, 3), Conv(c_expand, c3, 1)),
+                        nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                        # Final classification layer
+                        nn.Conv2d(c3, self.nc, 1),
+                    )
+                    for i, x in enumerate(ch)
+                )
             )
-        )
+        else:
+            # Original classification head without CBAM
+            self.cv3 = (
+                nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+                if self.legacy
+                else nn.ModuleList(
+                    nn.Sequential(
+                        nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                        nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                        nn.Conv2d(c3, self.nc, 1),
+                    )
+                    for x in ch
+                )
+            )
+        
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if self.end2end:
@@ -357,7 +376,7 @@ class OBB(Detect):
         >>> outputs = obb(x)
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, ch: tuple = ()):
+    def __init__(self, nc: int = 80, ne: int = 1, ch: tuple = (), use_cbam: bool = False, cbam_kernel: int | list = None):
         """
         Initialize OBB with number of classes `nc` and layer channels `ch`.
 
@@ -365,8 +384,10 @@ class OBB(Detect):
             nc (int): Number of classes.
             ne (int): Number of extra parameters.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
+            use_cbam (bool): Whether to use CBAM attention in classification head. Default: False.
+            cbam_kernel (int | list): Kernel size(s) for CBAM spatial attention (only used if use_cbam=True).
         """
-        super().__init__(nc, ch)
+        super().__init__(nc, ch, use_cbam, cbam_kernel)
         self.ne = ne  # number of extra parameters
 
         c4 = max(ch[0] // 4, self.ne)
