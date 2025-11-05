@@ -376,21 +376,17 @@ class OBB(Detect):
         >>> outputs = obb(x)
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, ch: tuple = (), use_cbam: bool = False, cbam_kernel: int | list = None):
+    def __init__(self, nc: int = 80, ne: int = 1, use_cbam: bool = False, cbam_kernel: int | list = None, ch: tuple = ()):
         """
         Initialize OBB with number of classes `nc` and layer channels `ch`.
 
         Args:
             nc (int): Number of classes.
             ne (int): Number of extra parameters.
-            ch (tuple): Tuple of channel sizes from backbone feature maps.
             use_cbam (bool): Whether to use CBAM attention in classification head. Default: False.
             cbam_kernel (int | list): Kernel size(s) for CBAM spatial attention (only used if use_cbam=True).
+            ch (tuple): Tuple of channel sizes from backbone feature maps (auto-filled by parser).
         """
-        # Handle backward compatibility: if ch is a bool, it's actually use_cbam
-        if isinstance(ch, bool):
-            use_cbam = ch
-            ch = ()
         super().__init__(nc, ch, use_cbam, cbam_kernel)
         self.ne = ne  # number of extra parameters
 

@@ -74,6 +74,7 @@ head:
   - [-1, 2, C3k2, [1024, True]] # 41 (P6/64-xlarge)
 
   # OBB Detection head WITHOUT CBAM (original)
-  # Format: [input_layers, repeats, module, [nc, ne, use_cbam]]
-  # use_cbam=False uses original classification head without attention
+  # Format: [input_layers, repeats, module, [nc, ne, use_cbam, cbam_kernel]]
+  # Args: nc (classes), ne (extra params), use_cbam (bool), cbam_kernel (optional)
+  # Note: 'ch' (channels) is automatically added by the parser from the 'from' layers
   - [[29, 32, 35, 38, 41], 1, OBB, [nc, 1, False]] # OBB Detect without CBAM (P2, P3, P4, P5, P6)
