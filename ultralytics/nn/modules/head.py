@@ -387,6 +387,10 @@ class OBB(Detect):
             use_cbam (bool): Whether to use CBAM attention in classification head. Default: False.
             cbam_kernel (int | list): Kernel size(s) for CBAM spatial attention (only used if use_cbam=True).
         """
+        # Handle backward compatibility: if ch is a bool, it's actually use_cbam
+        if isinstance(ch, bool):
+            use_cbam = ch
+            ch = ()
         super().__init__(nc, ch, use_cbam, cbam_kernel)
         self.ne = ne  # number of extra parameters
 
