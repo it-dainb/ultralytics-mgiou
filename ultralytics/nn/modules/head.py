@@ -31,12 +31,26 @@ class EfficientNetV2(nn.Module):
     for reduced downsampling (2x instead of 16x), making it suitable for YOLO detection heads.
     Width and depth multipliers allow scaling model capacity.
     
-    Available variants:
-        - 'nano' (0.5x width, 0.5x depth):  Ultra-lightweight for edge devices
-        - 'tiny' (0.75x width, 0.75x depth): Lightweight for mobile/embedded
-        - 'small' (1.0x width, 1.0x depth):  Standard EfficientNetV2-S (default)
-        - 'base' (1.1x width, 1.2x depth):   Higher capacity for complex scenes
-        - 'medium' (1.2x width, 1.4x depth): Even higher capacity
+    Available variants (width_mult, depth_mult):
+        Ultra-lightweight (0.1 - 0.4):
+            - 'micro'  (0.1, 0.1):  Minimal model for extreme edge devices
+            - 'pico'   (0.2, 0.2):  Very small model
+            - 'femto'  (0.3, 0.3):  Tiny model
+            - 'atto'   (0.4, 0.4):  Extra small model
+        
+        Lightweight (0.5 - 0.75):
+            - 'nano'   (0.5, 0.5):  ~2M params, fastest inference
+            - 'tiny'   (0.75, 0.75): ~4M params, good speed/accuracy
+        
+        Standard (1.0 - 1.2):
+            - 'small'  (1.0, 1.0):  ~7M params, standard EfficientNetV2-S (default)
+            - 'base'   (1.1, 1.2):  ~10M params, similar to EfficientNetV2-B2
+            - 'medium' (1.2, 1.4):  ~14M params, similar to EfficientNetV2-B3
+        
+        Large (1.3 - 1.5):
+            - 'large'  (1.3, 1.5):  Large model for high accuracy
+            - 'xlarge' (1.4, 1.6):  Extra large model
+            - 'huge'   (1.5, 1.8):  Huge model for maximum accuracy
     
     Attributes:
         blocks (nn.Sequential): Sequential container of MBConv/FusedMBConv blocks.
@@ -54,11 +68,25 @@ class EfficientNetV2(nn.Module):
     
     # EfficientNetV2 variant configurations (width_mult, depth_mult)
     VARIANTS = {
-        'nano':   (0.5,  0.5),   # ~2M params, fastest inference
-        'tiny':   (0.75, 0.75),  # ~4M params, good speed/accuracy
-        'small':  (1.0,  1.0),   # ~7M params, standard EfficientNetV2-S
-        'base':   (1.1,  1.2),   # ~10M params, similar to EfficientNetV2-B2
-        'medium': (1.2,  1.4),   # ~14M params, similar to EfficientNetV2-B3
+        # Ultra-lightweight variants (0.1 - 0.4)
+        'micro':    (0.1,  0.1),   # Minimal model for extreme edge devices
+        'pico':     (0.2,  0.2),   # Very small model
+        'femto':    (0.3,  0.3),   # Tiny model
+        'atto':     (0.4,  0.4),   # Extra small model
+        
+        # Lightweight variants (0.5 - 0.75)
+        'nano':     (0.5,  0.5),   # ~2M params, fastest inference
+        'tiny':     (0.75, 0.75),  # ~4M params, good speed/accuracy
+        
+        # Standard variants (1.0 - 1.2)
+        'small':    (1.0,  1.0),   # ~7M params, standard EfficientNetV2-S (default)
+        'base':     (1.1,  1.2),   # ~10M params, similar to EfficientNetV2-B2
+        'medium':   (1.2,  1.4),   # ~14M params, similar to EfficientNetV2-B3
+        
+        # Large variants (1.3 - 1.5)
+        'large':    (1.3,  1.5),   # Large model for high accuracy
+        'xlarge':   (1.4,  1.6),   # Extra large model
+        'huge':     (1.5,  1.8),   # Huge model for maximum accuracy
     }
     
     def __init__(self, c1, c2=None, variant='small'):
