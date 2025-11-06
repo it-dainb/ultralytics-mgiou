@@ -391,11 +391,21 @@ class Detect(nn.Module):
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
-            b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+            # Handle both standard Sequential and EfficientNetV2Head
+            if isinstance(b, EfficientNetV2Head):
+                # For EfficientNetV2Head, initialize the projection layer bias
+                b.proj.bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
+            else:
+                # Standard Sequential head
+                b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
         if self.end2end:
             for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
                 a[-1].bias.data[:] = 1.0  # box
-                b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+                # Handle both standard Sequential and EfficientNetV2Head
+                if isinstance(b, EfficientNetV2Head):
+                    b.proj.bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
+                else:
+                    b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
 
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
         """Decode bounding boxes from predictions."""
