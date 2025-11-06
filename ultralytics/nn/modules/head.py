@@ -29,28 +29,31 @@ class EfficientNetV2(nn.Module):
     
     This implementation uses the NAS-optimized block configuration with modified strides
     for reduced downsampling (2x instead of 16x), making it suitable for YOLO detection heads.
-    Width and depth multipliers allow scaling model capacity.
+    Width and depth multipliers allow scaling model capacity from 36K to 23M parameters.
     
-    Available variants (width_mult, depth_mult):
-        Ultra-lightweight (0.1 - 0.4):
-            - 'micro'  (0.1, 0.1):  Minimal model for extreme edge devices
-            - 'pico'   (0.2, 0.2):  Very small model
-            - 'femto'  (0.3, 0.3):  Tiny model
-            - 'atto'   (0.4, 0.4):  Extra small model
+    Available variants (width, depth, standalone params, full Detect head params):
+        Ultra-lightweight (0.1 - 0.4) - for extreme edge devices:
+            - 'micro'  (0.1, 0.1):  36K standalone,  1.34M in Detect head
+            - 'pico'   (0.2, 0.2):  52K standalone,  1.39M in Detect head
+            - 'femto'  (0.3, 0.3):  129K standalone, 1.63M in Detect head
+            - 'atto'   (0.4, 0.4):  363K standalone, 2.34M in Detect head
         
-        Lightweight (0.5 - 0.75):
-            - 'nano'   (0.5, 0.5):  ~2M params, fastest inference
-            - 'tiny'   (0.75, 0.75): ~4M params, good speed/accuracy
+        Lightweight (0.5 - 0.75) - for mobile/embedded devices:
+            - 'nano'   (0.5, 0.5):  640K standalone, 3.17M in Detect head
+            - 'tiny'   (0.75, 0.75): 2.26M standalone, 8.12M in Detect head
         
-        Standard (1.0 - 1.2):
-            - 'small'  (1.0, 1.0):  ~7M params, standard EfficientNetV2-S (default)
-            - 'base'   (1.1, 1.2):  ~10M params, similar to EfficientNetV2-B2
-            - 'medium' (1.2, 1.4):  ~14M params, similar to EfficientNetV2-B3
+        Standard (1.0 - 1.2) - balanced performance:
+            - 'small'  (1.0, 1.0):  5.64M standalone, 18.27M in Detect head (default)
+            - 'base'   (1.1, 1.2):  7.47M standalone, 23.77M in Detect head
+            - 'medium' (1.2, 1.4):  11.37M standalone, 35.55M in Detect head
         
-        Large (1.3 - 1.5):
-            - 'large'  (1.3, 1.5):  Large model for high accuracy
-            - 'xlarge' (1.4, 1.6):  Extra large model
-            - 'huge'   (1.5, 1.8):  Huge model for maximum accuracy
+        Large (1.3 - 1.5) - high accuracy for server deployment:
+            - 'large'  (1.3, 1.5):  14.19M standalone, 44.00M in Detect head
+            - 'xlarge' (1.4, 1.6):  17.40M standalone, 53.63M in Detect head
+            - 'huge'   (1.5, 1.8):  22.62M standalone, 69.31M in Detect head
+    
+    Note: Parameter range spans 51.5x from smallest (micro) to largest (huge) variant.
+          Standard Detect head without EfficientNetV2: 1.90M parameters.
     
     Attributes:
         blocks (nn.Sequential): Sequential container of MBConv/FusedMBConv blocks.
@@ -180,7 +183,11 @@ class EfficientNetV2(nn.Module):
         Forward pass through EfficientNetV2 blocks.
         
         The blocks downsample by factor of 2, preserving more spatial details for detection.
-        Output channels depend on the variant (nano: 96, tiny: 144, small: 192, base: 216, medium: 232).
+        Output channels vary by variant:
+            - Ultra-lightweight: micro=24, pico=40, femto=56, atto=80
+            - Lightweight: nano=96, tiny=144
+            - Standard: small=192, base=208, medium=232
+            - Large: large=248, xlarge=272, huge=288
         
         Args:
             x (torch.Tensor): Input tensor.
@@ -204,14 +211,29 @@ class EfficientNetV2Head(nn.Module):
     Args:
         c_in (int): Input channels.
         nc (int): Number of output classes.
-        variant (str): EfficientNetV2 variant ('nano', 'tiny', 'small', 'base', 'medium').
+        variant (str): EfficientNetV2 variant - see EfficientNetV2 class for all options.
     
-    Parameter counts by variant:
-        NANO     :    639,638 params ( 0.11x of small)
-        TINY     :  2,261,364 params ( 0.40x of small)
-        SMALL    :  5,641,712 params ( 1.00x of small)
-        BASE     :  7,472,000 params ( 1.32x of small)
-        MEDIUM   : 11,371,168 params ( 2.02x of small)
+    Standalone EfficientNetV2 parameter counts by variant:
+        Ultra-lightweight:
+            MICRO    :     36.33K params (0.006x of small)
+            PICO     :     51.78K params (0.009x of small)
+            FEMTO    :    129.07K params (0.023x of small)
+            ATTO     :    362.88K params (0.064x of small)
+        Lightweight:
+            NANO     :    639.64K params (0.113x of small)
+            TINY     :      2.26M params (0.401x of small)
+        Standard:
+            SMALL    :      5.64M params (1.000x of small, baseline)
+            BASE     :      7.47M params (1.324x of small)
+            MEDIUM   :     11.37M params (2.016x of small)
+        Large:
+            LARGE    :     14.19M params (2.515x of small)
+            XLARGE   :     17.40M params (3.084x of small)
+            HUGE     :     22.62M params (4.010x of small)
+    
+    Full Detect head (nc=80, 3 scales) parameter counts:
+        Range: 1.34M (micro) to 69.31M (huge) - 51.5x span
+        Standard Detect (no EfficientNetV2): 1.90M params
     """
     def __init__(self, c_in, nc, variant='small'):
         super().__init__()
@@ -234,6 +256,7 @@ class Detect(nn.Module):
 
     This class implements the detection head used in YOLO models for predicting bounding boxes and class probabilities.
     It supports both training and inference modes, with optional end-to-end detection capabilities.
+    Can optionally use EfficientNetV2 blocks in the classification head for enhanced feature extraction.
 
     Attributes:
         dynamic (bool): Force grid reconstruction.
@@ -250,6 +273,8 @@ class Detect(nn.Module):
         nl (int): Number of detection layers.
         reg_max (int): DFL channels.
         no (int): Number of outputs per anchor.
+        use_effnet (bool): Whether to use EfficientNetV2 in classification head.
+        effnet_variant (str): EfficientNetV2 variant (micro to huge, 12 options).
         stride (torch.Tensor): Strides computed during build.
         cv2 (nn.ModuleList): Convolution layers for box regression.
         cv3 (nn.ModuleList): Convolution layers for classification.
@@ -265,10 +290,19 @@ class Detect(nn.Module):
         postprocess: Post-process model predictions.
 
     Examples:
-        Create a detection head for 80 classes
+        Create a standard detection head for 80 classes
         >>> detect = Detect(nc=80, ch=(256, 512, 1024))
         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
         >>> outputs = detect(x)
+        
+        Create a detection head with EfficientNetV2 (ultra-lightweight)
+        >>> detect_micro = Detect(nc=80, ch=(256, 512, 1024), use_effnet=True, effnet_variant='micro')
+        
+        Create a detection head with EfficientNetV2 (balanced)
+        >>> detect_small = Detect(nc=80, ch=(256, 512, 1024), use_effnet=True, effnet_variant='small')
+        
+        Create a detection head with EfficientNetV2 (high accuracy)
+        >>> detect_large = Detect(nc=80, ch=(256, 512, 1024), use_effnet=True, effnet_variant='large')
     """
 
     dynamic = False  # force grid reconstruction
