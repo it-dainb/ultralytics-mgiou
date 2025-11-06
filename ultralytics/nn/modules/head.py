@@ -16,12 +16,189 @@ from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Residual, SwiGLUFFN
-from .conv import CBAM, Conv, DWConv
+from .conv import Conv, DWConv, MBConv, FusedMBConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
 __all__ = "Detect", "Segment", "Pose", "Polygon", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment"
 
+
+class EfficientNetV2(nn.Module):
+    """
+    EfficientNetV2 classification head using MBConv and FusedMBConv blocks.
+    
+    This implementation uses the exact NAS-optimized block configuration with configurable
+    width and depth multipliers for scaling model capacity.
+    Spatial dimensions are downsampled by 16x through the NAS-optimized stride configuration.
+    
+    Available variants:
+        - 'nano' (0.5x width, 0.5x depth):  Ultra-lightweight for edge devices
+        - 'tiny' (0.75x width, 0.75x depth): Lightweight for mobile/embedded
+        - 'small' (1.0x width, 1.0x depth):  Standard EfficientNetV2-S (default)
+        - 'base' (1.1x width, 1.2x depth):   Higher capacity for complex scenes
+        - 'medium' (1.2x width, 1.4x depth): Even higher capacity
+    
+    Attributes:
+        blocks (nn.Sequential): Sequential container of MBConv/FusedMBConv blocks.
+        
+    Configuration format: 'r{repeat}_k{kernel}_s{stride}_e{expand}_i{in_ch}_o{out_ch}_c{conv_type}_se{se_ratio}'
+    - r: number of block repeats (scaled by depth_mult)
+    - k: kernel size (NAS-optimized, not scaled)
+    - s: stride (NAS-optimized, preserved as-is)
+    - e: expansion ratio (NAS-optimized, not scaled)
+    - i: input channels (scaled by width_mult)
+    - o: output channels (scaled by width_mult)
+    - c: conv_type (1=FusedMBConv, 0=MBConv)
+    - se: squeeze-excitation ratio (NAS-optimized, not scaled)
+    """
+    
+    # EfficientNetV2 variant configurations (width_mult, depth_mult)
+    VARIANTS = {
+        'nano':   (0.5,  0.5),   # ~2M params, fastest inference
+        'tiny':   (0.75, 0.75),  # ~4M params, good speed/accuracy
+        'small':  (1.0,  1.0),   # ~7M params, standard EfficientNetV2-S
+        'base':   (1.1,  1.2),   # ~10M params, similar to EfficientNetV2-B2
+        'medium': (1.2,  1.4),   # ~14M params, similar to EfficientNetV2-B3
+    }
+    
+    def __init__(self, c1, c2=None, variant='small'):
+        """
+        Initialize EfficientNetV2 classification head with scaling.
+        
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int, optional): Unused, kept for compatibility. Output channels depend on variant.
+            variant (str): Model variant - 'nano', 'tiny', 'small', 'base', or 'medium'.
+        """
+        super().__init__()
+        
+        # Get width and depth multipliers for the variant
+        if variant not in self.VARIANTS:
+            raise ValueError(f"Unknown variant '{variant}'. Choose from: {list(self.VARIANTS.keys())}")
+        
+        width_mult, depth_mult = self.VARIANTS[variant]
+        
+        def make_divisible(v, divisor=8):
+            """Ensure channel counts are divisible by divisor for efficient computation."""
+            new_v = max(divisor, int(v + divisor / 2) // divisor * divisor)
+            if new_v < 0.9 * v:  # Ensure we don't reduce by more than 10%
+                new_v += divisor
+            return new_v
+        
+        # Base NAS-optimized configuration (DO NOT MODIFY the base structure)
+        # Format: (num_repeat, kernel_size, stride, expand_ratio, in_channels, out_channels, conv_type, se_ratio)
+        base_configs = [
+            (1, 3, 1, 1, 32, 16, 1, 0.0),      # r1_k3_s1_e1
+            (2, 3, 2, 4, 16, 32, 1, 0.0),      # r2_k3_s2_e4
+            (2, 3, 2, 4, 32, 48, 1, 0.0),      # r2_k3_s2_e4
+            (3, 3, 2, 4, 48, 96, 0, 0.25),     # r3_k3_s2_e4_se0.25
+            (5, 3, 1, 6, 96, 112, 0, 0.25),    # r5_k3_s1_e6_se0.25
+            (8, 3, 2, 6, 112, 192, 0, 0.25),   # r8_k3_s2_e6_se0.25
+        ]
+        
+        # Apply scaling to get final configuration
+        blocks = []
+        prev_out_ch = c1
+        
+        for num_repeat, kernel_size, stride, expand_ratio, base_in_ch, base_out_ch, conv_type, se_ratio in base_configs:
+            # Scale channels with width multiplier
+            out_ch = make_divisible(base_out_ch * width_mult)
+            
+            # Scale repeats with depth multiplier (round to nearest int)
+            scaled_repeat = max(1, int(num_repeat * depth_mult))
+            
+            for i in range(scaled_repeat):
+                # First block in stage uses previous output channels or c1, others use out_ch
+                inp = prev_out_ch if i == 0 else out_ch
+                # First block in stage uses specified stride, others use stride=1
+                s = stride if i == 0 else 1
+                
+                if conv_type == 1:  # FusedMBConv
+                    blocks.append(
+                        FusedMBConv(
+                            c1=inp,
+                            c2=out_ch,
+                            expand_ratio=expand_ratio,
+                            kernel_size=kernel_size,
+                            stride=s,
+                        )
+                    )
+                else:  # MBConv
+                    blocks.append(
+                        MBConv(
+                            c1=inp,
+                            c2=out_ch,
+                            expand_ratio=expand_ratio,
+                            kernel_size=kernel_size,
+                            stride=s,
+                            se_ratio=se_ratio,
+                        )
+                    )
+            
+            prev_out_ch = out_ch
+        
+        self.blocks = nn.Sequential(*blocks)
+        self.out_channels = out_ch  # Store final output channels
+        self.variant = variant
+        
+        # Calculate total downsampling factor from strides
+        # Strides: 1, 2, 2, 2, 1, 2 -> total downsampling = 2^4 = 16
+        self.downsample_factor = 16
+        
+    def forward(self, x):
+        """
+        Forward pass through EfficientNetV2 blocks.
+        
+        The blocks downsample by factor of 16, producing rich features at reduced resolution.
+        Output channels depend on the variant (nano: 96, tiny: 144, small: 192, base: 216, medium: 232).
+        
+        Args:
+            x (torch.Tensor): Input tensor.
+            
+        Returns:
+            (torch.Tensor): Output tensor with shape (B, out_channels, H/16, W/16).
+        """
+        # Pass through EfficientNetV2 blocks (downsamples by factor of 16)
+        x = self.blocks(x)
+        
+        return x
+
+class EfficientNetV2Head(nn.Module):
+    """
+    Wrapper for EfficientNetV2 that adds projection and upsampling layers.
+    
+    This class wraps an EfficientNetV2 backbone with a projection layer to convert
+    the dynamic output channels to the required number of classes, followed by
+    bilinear upsampling to restore original spatial dimensions.
+    
+    Args:
+        c_in (int): Input channels.
+        nc (int): Number of output classes.
+        variant (str): EfficientNetV2 variant ('nano', 'tiny', 'small', 'base', 'medium').
+
+
+    Reference (small variant): 5,641,712 parameters
+
+    NANO     :    639,638 params ( 0.11x of small)
+    TINY     :  2,261,364 params ( 0.40x of small)
+    SMALL    :  5,641,712 params ( 1.00x of small)
+    BASE     :  7,472,000 params ( 1.32x of small)
+    MEDIUM   : 11,371,168 params ( 2.02x of small)
+    """
+    def __init__(self, c_in, nc, variant='small'):
+        super().__init__()
+        self.effnet = EfficientNetV2(c_in, None, variant=variant)
+        # Use the dynamic output channels from EfficientNetV2
+        self.proj = nn.Conv2d(self.effnet.out_channels, nc, 1)
+        
+    def forward(self, x):
+        input_size = x.shape[2:]
+        x = self.effnet(x)  # downsample by 16x, outputs self.effnet.out_channels
+        x = self.proj(x)  # project to nc classes
+        # Upsample back to input size
+        if x.shape[2:] != input_size:
+            x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
+        return x
 
 class Detect(nn.Module):
     """
@@ -77,18 +254,15 @@ class Detect(nn.Module):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, ch: tuple = (), use_cbam: bool = False, cbam_kernel: int | list = None):
+    def __init__(self, nc: int = 80, ch: tuple = (), use_effnet: bool = False, effnet_variant: str = 'small'):
         """
         Initialize the YOLO detection layer with specified number of classes and channels.
 
         Args:
             nc (int): Number of classes.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
-            use_cbam (bool): Whether to use CBAM attention in classification head. Default: False.
-            cbam_kernel (int | list): Kernel size(s) for CBAM spatial attention (only used if use_cbam=True).
-                - int: Use same kernel for all layers (3 or 7)
-                - list: Specific kernel per layer (e.g., [7, 7, 3] for P3, P4, P5)
-                - None: Auto-adaptive based on feature map scale (P3→7, P4→7, P5+→3)
+            use_effnet (bool): Whether to use EfficientNetV2 in classification head. Default: False.
+            effnet_variant (str): EfficientNetV2 variant - 'nano', 'tiny', 'small', 'base', 'medium'. Default: 'small'.
         """
         super().__init__()
         self.nc = nc  # number of classes
@@ -96,7 +270,8 @@ class Detect(nn.Module):
         self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
-        self.use_cbam = use_cbam  # store for reference
+        self.use_effnet = use_effnet  # store for reference
+        self.effnet_variant = effnet_variant  # store variant
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         
         # Box regression head (unchanged)
@@ -104,69 +279,23 @@ class Detect(nn.Module):
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
         )
         
-        # Classification head - with or without CBAM
-        if use_cbam:
-            # Determine adaptive CBAM kernel sizes based on feature pyramid level
-            # Larger feature maps (P3) → larger kernels for more spatial context
-            # Smaller feature maps (P5+) → smaller kernels for efficiency
-            # Note: CBAM spatial attention only supports kernel sizes 3 or 7
-            if cbam_kernel is None:
-                # Auto-adaptive kernel sizes: alternate between 7 and 3 based on level
-                # P3 (largest) → 7, P4 → 7, P5+ (small) → 3
-                # This provides good context for P3/P4 while being efficient for P5+
-                cbam_kernels = []
-                for i in range(self.nl):
-                    # First 2 levels use 7×7 for rich spatial context
-                    # Remaining levels use 3×3 for efficiency
-                    kernel = 7 if i < 2 else 3
-                    cbam_kernels.append(kernel)
-            elif isinstance(cbam_kernel, int):
-                # Fixed kernel size for all layers
-                assert cbam_kernel in {3, 7}, "CBAM kernel_size must be 3 or 7"
-                cbam_kernels = [cbam_kernel] * self.nl
-            else:
-                # User-provided list - validate all are 3 or 7
-                cbam_kernels = list(cbam_kernel) if len(cbam_kernel) == self.nl else [cbam_kernel[0]] * self.nl
-                assert all(k in {3, 7} for k in cbam_kernels), "All CBAM kernel sizes must be 3 or 7"
-            
-            # Enhanced classification head with adaptive CBAM attention
-            # Architecture: Conv (expand) -> CBAM (adaptive kernel) -> Conv layers -> Conv2d (classify)
-            c_expand = max(c3 * 2, 256)  # Expanded channel size for better feature extraction
+        # Classification head - with or without EfficientNetV2
+        if use_effnet:
+            # Use EfficientNetV2 blocks for classification head
+            # Output channels depend on variant (dynamically determined)
+            # We project to nc classes, then upsample back to original resolution
+            self.cv3 = nn.ModuleList(EfficientNetV2Head(x, self.nc, effnet_variant) for x in ch)
+        else:
+            # Original classification head without EfficiencyNetV2
             self.cv3 = (
                 nn.ModuleList(
                     nn.Sequential(
-                        # Channel expansion for richer features
-                        Conv(x, c_expand, 1, 1),
-                        # CBAM attention with adaptive kernel size (P3→7, P4→7, P5→3)
-                        CBAM(c_expand, kernel_size=cbam_kernels[i]),
-                        # Feature extraction layers
-                        Conv(c_expand, c3, 3),
-                        Conv(c3, c3, 3),
-                        # Final classification layer
-                        nn.Conv2d(c3, self.nc, 1),
+                        Conv(x, c3, 3), 
+                        Conv(c3, c3, 3), 
+                        nn.Conv2d(c3, self.nc, 1)
                     ) 
-                    for i, x in enumerate(ch)
+                    for x in ch
                 )
-                if self.legacy
-                else nn.ModuleList(
-                    nn.Sequential(
-                        # Channel expansion for richer features
-                        Conv(x, c_expand, 1, 1),
-                        # CBAM attention with adaptive kernel size (P3→7, P4→7, P5→3)
-                        CBAM(c_expand, kernel_size=cbam_kernels[i]),
-                        # Feature extraction layers with depthwise convolutions
-                        nn.Sequential(DWConv(c_expand, c_expand, 3), Conv(c_expand, c3, 1)),
-                        nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                        # Final classification layer
-                        nn.Conv2d(c3, self.nc, 1),
-                    )
-                    for i, x in enumerate(ch)
-                )
-            )
-        else:
-            # Original classification head without CBAM
-            self.cv3 = (
-                nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
                 if self.legacy
                 else nn.ModuleList(
                     nn.Sequential(
@@ -376,18 +505,18 @@ class OBB(Detect):
         >>> outputs = obb(x)
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, use_cbam: bool = False, cbam_kernel: int | list = None, ch: tuple = ()):
+    def __init__(self, nc: int = 80, ne: int = 1, use_effnet: bool = False, effnet_variant: str = 'small', ch: tuple = ()):
         """
         Initialize OBB with number of classes `nc` and layer channels `ch`.
 
         Args:
             nc (int): Number of classes.
             ne (int): Number of extra parameters.
-            use_cbam (bool): Whether to use CBAM attention in classification head. Default: False.
-            cbam_kernel (int | list): Kernel size(s) for CBAM spatial attention (only used if use_cbam=True).
+            use_effnet (bool): Whether to use CBAM attention in classification head. Default: False.
+            effnet_variant (str): EfficientNetV2 variant - 'nano', 'tiny', 'small', 'base', 'medium'. Default: 'small'.
             ch (tuple): Tuple of channel sizes from backbone feature maps (auto-filled by parser).
         """
-        super().__init__(nc, ch, use_cbam, cbam_kernel)
+        super().__init__(nc, ch, use_effnet, effnet_variant)
         self.ne = ne  # number of extra parameters
 
         c4 = max(ch[0] // 4, self.ne)

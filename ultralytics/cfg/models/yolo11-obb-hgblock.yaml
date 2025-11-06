@@ -6,11 +6,19 @@
 nc: 1 # number of classes
 
 scales:
-  n: [0.50, 0.25, 1024]
-  s: [0.50, 0.50, 1024]
-  m: [0.50, 1.00, 512]
-  l: [1.00, 1.00, 512]
-  x: [1.00, 1.50, 512]
+  # Format: [depth_multiple, width_multiple, max_channels]
+  # depth_multiple: scales the number of 'repeats' in each layer
+  # width_multiple: scales the number of channels
+  # max_channels: maximum channel limit
+  
+  # Optimized scales for parameter efficiency
+  # Width multiplier has quadratic impact on params (channels²)
+  t: [0.33, 0.15, 1024]  # tiny: ~4-5M params (ultra lightweight)
+  n: [0.33, 0.25, 1024]  # nano: ~10-11M params (lightweight)
+  s: [0.50, 0.50, 1024]  # small: ~20-25M params
+  m: [0.67, 0.75, 768]   # medium: ~35-40M params
+  l: [1.00, 1.00, 512]   # large: ~50-60M params
+  x: [1.00, 1.25, 512]   # xlarge: ~70-80M params
 
 # HGBlock-based backbone (inspired by RT-DETR)
 backbone:
@@ -74,7 +82,8 @@ head:
   - [-1, 2, C3k2, [1024, True]] # 41 (P6/64-xlarge)
 
   # OBB Detection head WITHOUT CBAM (original)
-  # Format: [input_layers, repeats, module, [nc, ne, use_cbam, cbam_kernel]]
-  # Args: nc (classes), ne (extra params), use_cbam (bool), cbam_kernel (optional)
-  # Note: 'ch' (channels) is automatically added by the parser from the 'from' layers
-  - [[29, 32, 35, 38, 41], 1, OBB, [nc, 1, False]] # OBB Detect without CBAM (P2, P3, P4, P5, P6)
+  # Format: [input_layers, repeats, module, [nc, ne, use_effnet, cbam_kernel]]
+  # Args: nc (classes), ne (extra params), use_effnet (bool), cbam_kernel (None or int/list)
+  # Note: 'ch' (channels) is automatically appended by the parser from the 'from' layers
+  # You MUST specify all 4 parameters (use None for cbam_kernel if use_effnet=False)
+  - [[29, 32, 35, 38, 41], 1, OBB, [nc, 1, False, None]] # OBB Detect without CBAM

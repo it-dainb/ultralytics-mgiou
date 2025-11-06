@@ -23,6 +23,9 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
+    "SqueezeExcitation",
+    "MBConv",
+    "FusedMBConv",
     "Index",
 )
 
@@ -712,3 +715,207 @@ class Index(nn.Module):
             (torch.Tensor): Selected tensor.
         """
         return x[self.index]
+
+
+class SqueezeExcitation(nn.Module):
+    """
+    Squeeze-and-Excitation block.
+
+    This block implements the Squeeze-and-Excitation mechanism from
+    https://arxiv.org/abs/1709.01507.
+
+    Attributes:
+        avgpool (nn.AdaptiveAvgPool2d): Global average pooling.
+        fc1 (nn.Conv2d): First fully connected layer (implemented as 1x1 conv).
+        fc2 (nn.Conv2d): Second fully connected layer (implemented as 1x1 conv).
+        activation (nn.Module): Activation function for hidden layer.
+        scale_activation (nn.Module): Activation function for output scaling.
+    """
+
+    def __init__(self, input_channels, squeeze_channels, activation=nn.ReLU, scale_activation=nn.Sigmoid):
+        """
+        Initialize Squeeze-and-Excitation block.
+
+        Args:
+            input_channels (int): Number of input channels.
+            squeeze_channels (int): Number of squeeze channels.
+            activation (nn.Module): Activation function for hidden layer.
+            scale_activation (nn.Module): Activation function for output scaling.
+        """
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(input_channels, squeeze_channels, 1)
+        self.fc2 = nn.Conv2d(squeeze_channels, input_channels, 1)
+        self.activation = activation()
+        self.scale_activation = scale_activation()
+
+    def forward(self, x):
+        """
+        Apply Squeeze-and-Excitation to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): SE-attended output tensor.
+        """
+        scale = self.avgpool(x)
+        scale = self.fc1(scale)
+        scale = self.activation(scale)
+        scale = self.fc2(scale)
+        scale = self.scale_activation(scale)
+        return scale * x
+
+
+class MBConv(nn.Module):
+    """
+    Mobile Inverted Bottleneck Convolution (MBConv) block.
+
+    This block is used in EfficientNet architectures and implements the inverted
+    residual structure with expansion, depthwise convolution, squeeze-excitation,
+    and projection layers.
+
+    Attributes:
+        use_res_connect (bool): Whether to use residual connection.
+        block (nn.Sequential): Sequential block containing all layers.
+        out_channels (int): Number of output channels.
+
+    References:
+        https://arxiv.org/abs/1905.11946
+    """
+
+    def __init__(self, c1, c2, expand_ratio=1, kernel_size=3, stride=1, se_ratio=0.25, drop_path_prob=0.0):
+        """
+        Initialize MBConv block.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            expand_ratio (float): Expansion ratio for hidden dimension.
+            kernel_size (int): Kernel size for depthwise convolution.
+            stride (int): Stride for depthwise convolution.
+            se_ratio (float): Squeeze-excitation ratio.
+            drop_path_prob (float): Drop path probability for stochastic depth.
+        """
+        super().__init__()
+        self.use_res_connect = stride == 1 and c1 == c2
+        self.drop_path_prob = drop_path_prob
+
+        layers = []
+        expanded_channels = int(c1 * expand_ratio)
+
+        # Expansion phase
+        if expand_ratio != 1:
+            layers.append(Conv(c1, expanded_channels, k=1, s=1, act=nn.SiLU()))
+
+        # Depthwise convolution
+        layers.append(
+            Conv(
+                expanded_channels,
+                expanded_channels,
+                k=kernel_size,
+                s=stride,
+                g=expanded_channels,
+                act=nn.SiLU(),
+            )
+        )
+
+        # Squeeze and Excitation
+        if se_ratio > 0:
+            squeeze_channels = max(1, int(c1 * se_ratio))
+            layers.append(SqueezeExcitation(expanded_channels, squeeze_channels))
+
+        # Projection phase
+        layers.append(Conv(expanded_channels, c2, k=1, s=1, act=False))
+
+        self.block = nn.Sequential(*layers)
+        self.out_channels = c2
+
+    def forward(self, x):
+        """
+        Apply MBConv block to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        result = self.block(x)
+        if self.use_res_connect:
+            if self.drop_path_prob > 0 and self.training:
+                # Apply stochastic depth
+                keep_prob = 1 - self.drop_path_prob
+                mask = torch.rand(x.shape[0], 1, 1, 1, device=x.device) < keep_prob
+                result = result / keep_prob * mask
+            result = result + x
+        return result
+
+
+class FusedMBConv(nn.Module):
+    """
+    Fused Mobile Inverted Bottleneck Convolution block.
+
+    This block is used in EfficientNetV2 and fuses the expansion and depthwise
+    convolution into a single convolution for improved efficiency.
+
+    Attributes:
+        use_res_connect (bool): Whether to use residual connection.
+        block (nn.Sequential): Sequential block containing all layers.
+        out_channels (int): Number of output channels.
+
+    References:
+        https://arxiv.org/abs/2104.00298
+    """
+
+    def __init__(self, c1, c2, expand_ratio=1, kernel_size=3, stride=1, drop_path_prob=0.0):
+        """
+        Initialize FusedMBConv block.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            expand_ratio (float): Expansion ratio for hidden dimension.
+            kernel_size (int): Kernel size for fused convolution.
+            stride (int): Stride for fused convolution.
+            drop_path_prob (float): Drop path probability for stochastic depth.
+        """
+        super().__init__()
+        self.use_res_connect = stride == 1 and c1 == c2
+        self.drop_path_prob = drop_path_prob
+
+        layers = []
+        expanded_channels = int(c1 * expand_ratio)
+
+        if expand_ratio != 1:
+            # Fused expansion with spatial convolution
+            layers.append(Conv(c1, expanded_channels, k=kernel_size, s=stride, act=nn.SiLU()))
+
+            # Projection phase
+            layers.append(Conv(expanded_channels, c2, k=1, s=1, act=False))
+        else:
+            # No expansion, just apply regular convolution
+            layers.append(Conv(c1, c2, k=kernel_size, s=stride, act=nn.SiLU()))
+
+        self.block = nn.Sequential(*layers)
+        self.out_channels = c2
+
+    def forward(self, x):
+        """
+        Apply FusedMBConv block to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        result = self.block(x)
+        if self.use_res_connect:
+            if self.drop_path_prob > 0 and self.training:
+                # Apply stochastic depth
+                keep_prob = 1 - self.drop_path_prob
+                mask = torch.rand(x.shape[0], 1, 1, 1, device=x.device) < keep_prob
+                result = result / keep_prob * mask
+            result = result + x
+        return result
