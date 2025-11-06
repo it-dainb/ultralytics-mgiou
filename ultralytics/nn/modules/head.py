@@ -27,9 +27,9 @@ class EfficientNetV2(nn.Module):
     """
     EfficientNetV2 classification head using MBConv and FusedMBConv blocks.
     
-    This implementation uses the exact NAS-optimized block configuration with configurable
-    width and depth multipliers for scaling model capacity.
-    Spatial dimensions are downsampled by 16x through the NAS-optimized stride configuration.
+    This implementation uses the NAS-optimized block configuration with modified strides
+    for reduced downsampling (2x instead of 16x), making it suitable for YOLO detection heads.
+    Width and depth multipliers allow scaling model capacity.
     
     Available variants:
         - 'nano' (0.5x width, 0.5x depth):  Ultra-lightweight for edge devices
@@ -44,7 +44,7 @@ class EfficientNetV2(nn.Module):
     Configuration format: 'r{repeat}_k{kernel}_s{stride}_e{expand}_i{in_ch}_o{out_ch}_c{conv_type}_se{se_ratio}'
     - r: number of block repeats (scaled by depth_mult)
     - k: kernel size (NAS-optimized, not scaled)
-    - s: stride (NAS-optimized, preserved as-is)
+    - s: stride (modified for YOLO: 2x total downsampling)
     - e: expansion ratio (NAS-optimized, not scaled)
     - i: input channels (scaled by width_mult)
     - o: output channels (scaled by width_mult)
@@ -85,15 +85,17 @@ class EfficientNetV2(nn.Module):
                 new_v += divisor
             return new_v
         
-        # Base NAS-optimized configuration (DO NOT MODIFY the base structure)
+        # Modified configuration for YOLO detection (reduced downsampling)
+        # Original NAS strides: [1, 2, 2, 2, 1, 2] = 16x downsample
+        # Modified strides:     [1, 1, 2, 1, 1, 1] = 2x downsample (better for detection)
         # Format: (num_repeat, kernel_size, stride, expand_ratio, in_channels, out_channels, conv_type, se_ratio)
         base_configs = [
-            (1, 3, 1, 1, 32, 16, 1, 0.0),      # r1_k3_s1_e1
-            (2, 3, 2, 4, 16, 32, 1, 0.0),      # r2_k3_s2_e4
-            (2, 3, 2, 4, 32, 48, 1, 0.0),      # r2_k3_s2_e4
-            (3, 3, 2, 4, 48, 96, 0, 0.25),     # r3_k3_s2_e4_se0.25
-            (5, 3, 1, 6, 96, 112, 0, 0.25),    # r5_k3_s1_e6_se0.25
-            (8, 3, 2, 6, 112, 192, 0, 0.25),   # r8_k3_s2_e6_se0.25
+            (1, 3, 1, 1, 32, 16, 1, 0.0),      # r1_k3_s1_e1 (stride 1)
+            (2, 3, 1, 4, 16, 32, 1, 0.0),      # r2_k3_s1_e4 (reduced from stride 2)
+            (2, 3, 2, 4, 32, 48, 1, 0.0),      # r2_k3_s2_e4 (keep stride 2)
+            (3, 3, 1, 4, 48, 96, 0, 0.25),     # r3_k3_s1_e4_se0.25 (reduced from stride 2)
+            (5, 3, 1, 6, 96, 112, 0, 0.25),    # r5_k3_s1_e6_se0.25 (stride 1)
+            (8, 3, 1, 6, 112, 192, 0, 0.25),   # r8_k3_s1_e6_se0.25 (reduced from stride 2)
         ]
         
         # Apply scaling to get final configuration
@@ -142,23 +144,23 @@ class EfficientNetV2(nn.Module):
         self.variant = variant
         
         # Calculate total downsampling factor from strides
-        # Strides: 1, 2, 2, 2, 1, 2 -> total downsampling = 2^4 = 16
-        self.downsample_factor = 16
+        # Modified strides: 1, 1, 2, 1, 1, 1 -> total downsampling = 2^1 = 2x
+        self.downsample_factor = 2
         
     def forward(self, x):
         """
         Forward pass through EfficientNetV2 blocks.
         
-        The blocks downsample by factor of 16, producing rich features at reduced resolution.
+        The blocks downsample by factor of 2, preserving more spatial details for detection.
         Output channels depend on the variant (nano: 96, tiny: 144, small: 192, base: 216, medium: 232).
         
         Args:
             x (torch.Tensor): Input tensor.
             
         Returns:
-            (torch.Tensor): Output tensor with shape (B, out_channels, H/16, W/16).
+            (torch.Tensor): Output tensor with shape (B, out_channels, H/2, W/2).
         """
-        # Pass through EfficientNetV2 blocks (downsamples by factor of 16)
+        # Pass through EfficientNetV2 blocks (downsamples by factor of 2)
         x = self.blocks(x)
         
         return x
@@ -169,21 +171,19 @@ class EfficientNetV2Head(nn.Module):
     
     This class wraps an EfficientNetV2 backbone with a projection layer to convert
     the dynamic output channels to the required number of classes, followed by
-    bilinear upsampling to restore original spatial dimensions.
+    bilinear upsampling to restore original spatial dimensions (2x upsampling).
     
     Args:
         c_in (int): Input channels.
         nc (int): Number of output classes.
         variant (str): EfficientNetV2 variant ('nano', 'tiny', 'small', 'base', 'medium').
-
-
-    Reference (small variant): 5,641,712 parameters
-
-    NANO     :    639,638 params ( 0.11x of small)
-    TINY     :  2,261,364 params ( 0.40x of small)
-    SMALL    :  5,641,712 params ( 1.00x of small)
-    BASE     :  7,472,000 params ( 1.32x of small)
-    MEDIUM   : 11,371,168 params ( 2.02x of small)
+    
+    Parameter counts by variant:
+        NANO     :    639,638 params ( 0.11x of small)
+        TINY     :  2,261,364 params ( 0.40x of small)
+        SMALL    :  5,641,712 params ( 1.00x of small)
+        BASE     :  7,472,000 params ( 1.32x of small)
+        MEDIUM   : 11,371,168 params ( 2.02x of small)
     """
     def __init__(self, c_in, nc, variant='small'):
         super().__init__()
@@ -193,9 +193,9 @@ class EfficientNetV2Head(nn.Module):
         
     def forward(self, x):
         input_size = x.shape[2:]
-        x = self.effnet(x)  # downsample by 16x, outputs self.effnet.out_channels
+        x = self.effnet(x)  # downsample by 2x, outputs self.effnet.out_channels
         x = self.proj(x)  # project to nc classes
-        # Upsample back to input size
+        # Upsample back to input size (2x upsampling)
         if x.shape[2:] != input_size:
             x = F.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
         return x
