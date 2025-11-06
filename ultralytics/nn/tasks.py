@@ -1757,6 +1757,15 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is CBAM:
+            c1 = ch[f]
+            c2 = c1  # CBAM doesn't change channel count
+            # CBAM expects (c1, kernel_size), not (c2, kernel_size)
+            # If args are [c2, kernel_size], replace c2 with c1
+            if len(args) > 0 and isinstance(args[0], int):
+                args = [c1, *args[1:]]  # args = [c1, kernel_size]
+            else:
+                args = [c1] + args  # args = [c1, ...]
         else:
             c2 = ch[f]
 
