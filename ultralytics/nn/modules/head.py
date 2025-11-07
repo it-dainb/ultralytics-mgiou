@@ -456,18 +456,23 @@ class Detect(nn.Module):
             # Handle both standard Sequential and EfficientNetV2Head
             if isinstance(b, EfficientNetV2Head):
                 # For EfficientNetV2Head, initialize the projection layer bias
-                b.proj.bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
+                # Use tensor ops (torch.log) so this works under FX/ONNX export
+                val = torch.log(torch.as_tensor(5.0 / m.nc, device=s.device) / (640.0 / s) ** 2)
+                b.proj.bias.data[:m.nc] = val
             else:
                 # Standard Sequential head
-                b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+                val = torch.log(torch.as_tensor(5.0 / m.nc, device=s.device) / (640.0 / s) ** 2)
+                b[-1].bias.data[:m.nc] = val  # cls (.01 objects, 80 classes, 640 img)
         if self.end2end:
             for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
                 a[-1].bias.data[:] = 1.0  # box
                 # Handle both standard Sequential and EfficientNetV2Head
                 if isinstance(b, EfficientNetV2Head):
-                    b.proj.bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
+                    val = torch.log(torch.as_tensor(5.0 / m.nc, device=s.device) / (640.0 / s) ** 2)
+                    b.proj.bias.data[:m.nc] = val
                 else:
-                    b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+                    val = torch.log(torch.as_tensor(5.0 / m.nc, device=s.device) / (640.0 / s) ** 2)
+                    b[-1].bias.data[:m.nc] = val  # cls (.01 objects, 80 classes, 640 img)
 
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
         """Decode bounding boxes from predictions."""
@@ -1138,7 +1143,9 @@ class YOLOEDetect(Detect):
             a[-1].bias.data[:] = 1.0  # box
             # b[-1].bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
             b[-1].bias.data[:] = 0.0
-            c.bias.data[:] = math.log(5 / m.nc / (640 / s) ** 2)
+            # Use tensor ops (torch.log) to avoid calling .item() during export/tracing
+            val = torch.log(torch.as_tensor(5.0 / m.nc, device=s.device) / (640.0 / s) ** 2)
+            c.bias.data[:] = val
 
 
 class YOLOESegment(YOLOEDetect):
