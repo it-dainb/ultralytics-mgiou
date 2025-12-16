@@ -258,12 +258,14 @@ class BasePredictor:
                 Source for inference.
         """
         self.imgsz = check_imgsz(self.args.imgsz, stride=self.model.stride, min_dim=2)  # check image size
+        # Determine channels: grayscale mode (1 channel) or from model (default 3)
+        channels = 1 if getattr(self.args, "grayscale", False) else getattr(self.model, "ch", 3)
         self.dataset = load_inference_source(
             source=source,
             batch=self.args.batch,
             vid_stride=self.args.vid_stride,
             buffer=self.args.stream_buffer,
-            channels=getattr(self.model, "ch", 3),
+            channels=channels,
         )
         self.source_type = self.dataset.source_type
         long_sequence = (

@@ -669,7 +669,8 @@ class ClassificationModel(BaseModel):
         self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
 
         # Define model
-        ch = self.yaml["channels"] = self.yaml.get("channels", ch)  # input channels
+        # Always use provided ch parameter (e.g., for grayscale mode), fall back to yaml value if not specified
+        ch = self.yaml["channels"] = ch if ch != 3 else self.yaml.get("channels", ch)  # input channels
         if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml["nc"] = nc  # override YAML value

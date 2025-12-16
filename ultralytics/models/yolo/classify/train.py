@@ -126,7 +126,8 @@ class ClassificationTrainer(BaseTrainer):
         Returns:
             (ClassificationDataset): Dataset for the specified mode.
         """
-        return ClassificationDataset(root=img_path, args=self.args, augment=mode == "train", prefix=mode)
+        grayscale = getattr(self.args, "grayscale", False)
+        return ClassificationDataset(root=img_path, args=self.args, augment=mode == "train", prefix=mode, grayscale=grayscale)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         """
