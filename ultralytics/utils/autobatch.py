@@ -87,7 +87,13 @@ def autobatch(
     # Profile batch sizes
     batch_sizes = [1, 2, 4, 8, 16] if t < 16 else [1, 2, 4, 8, 16, 32, 64]
     try:
-        img = [torch.empty(b, 3, imgsz, imgsz) for b in batch_sizes]
+        # Get input channels from model's first conv layer (supports grayscale with ch=1)
+        ch = 3  # default to RGB
+        if hasattr(model, "model") and len(model.model) > 0:
+            first_layer = model.model[0]
+            if hasattr(first_layer, "conv") and hasattr(first_layer.conv, "in_channels"):
+                ch = first_layer.conv.in_channels
+        img = [torch.empty(b, ch, imgsz, imgsz) for b in batch_sizes]
         results = profile_ops(img, model, n=1, device=device, max_num_obj=max_num_obj)
 
         # Fit a solution
