@@ -240,6 +240,7 @@ CFG_BOOL_KEYS = frozenset(
         "nms",
         "profile",
         "multi_scale",
+        "grayscale",
     }
 )
 

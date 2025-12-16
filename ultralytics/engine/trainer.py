@@ -640,6 +640,10 @@ class BaseTrainer:
             LOGGER.info("Overriding class names with single class.")
             data["names"] = {0: "item"}
             data["nc"] = 1
+        # Handle grayscale mode: override channels to 1
+        if getattr(self.args, "grayscale", False):
+            LOGGER.info("Grayscale mode enabled: setting channels to 1.")
+            data["channels"] = 1
         return data
 
     def setup_model(self):

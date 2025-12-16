@@ -22,6 +22,8 @@ from ultralytics.utils.torch_utils import TORCHVISION_0_18
 
 from .augment import (
     Compose,
+    DEFAULT_MEAN,
+    DEFAULT_STD,
     Format,
     LetterBox,
     RandomLoadText,
@@ -757,7 +759,7 @@ class ClassificationDataset:
         verify_images: Verify all images in dataset.
     """
 
-    def __init__(self, root: str, args, augment: bool = False, prefix: str = ""):
+    def __init__(self, root: str, args, augment: bool = False, prefix: str = "", grayscale: bool = False):
         """
         Initialize YOLO classification dataset with root directory, arguments, augmentations, and cache settings.
 
@@ -767,6 +769,7 @@ class ClassificationDataset:
                 parameters, and cache settings.
             augment (bool, optional): Whether to apply augmentations to the dataset.
             prefix (str, optional): Prefix for logging and cache filenames, aiding in dataset identification.
+            grayscale (bool, optional): Whether to convert images to grayscale (1 channel).
         """
         import torchvision  # scope for faster 'import ultralytics'
 
@@ -777,6 +780,7 @@ class ClassificationDataset:
             self.base = torchvision.datasets.ImageFolder(root=root)
         self.samples = self.base.samples
         self.root = self.base.root
+        self.grayscale = grayscale
 
         # Initialize attributes
         if augment and args.fraction < 1.0:  # reduce training fraction
@@ -793,6 +797,9 @@ class ClassificationDataset:
         self.samples = self.verify_images()  # filter out bad images
         self.samples = [list(x) + [Path(x[0]).with_suffix(".npy"), None] for x in self.samples]  # file, index, npy, im
         scale = (1.0 - args.scale, 1.0)  # (0.08, 1.0)
+        # Use single-channel mean/std for grayscale, otherwise use defaults (None triggers defaults in functions)
+        transform_mean = (0.5,) if grayscale else DEFAULT_MEAN
+        transform_std = (0.5,) if grayscale else DEFAULT_STD
         self.torch_transforms = (
             classify_augmentations(
                 size=args.imgsz,
@@ -800,13 +807,15 @@ class ClassificationDataset:
                 hflip=args.fliplr,
                 vflip=args.flipud,
                 erasing=args.erasing,
-                auto_augment=args.auto_augment,
-                hsv_h=args.hsv_h,
-                hsv_s=args.hsv_s,
-                hsv_v=args.hsv_v,
+                auto_augment=args.auto_augment if not grayscale else None,  # Disable color augmentations for grayscale
+                hsv_h=args.hsv_h if not grayscale else 0.0,  # Disable HSV augmentations for grayscale
+                hsv_s=args.hsv_s if not grayscale else 0.0,
+                hsv_v=args.hsv_v if not grayscale else 0.0,
+                mean=transform_mean,
+                std=transform_std,
             )
             if augment
-            else classify_transforms(size=args.imgsz)
+            else classify_transforms(size=args.imgsz, mean=transform_mean, std=transform_std)
         )
 
     def __getitem__(self, i: int) -> dict:
@@ -831,6 +840,9 @@ class ClassificationDataset:
             im = cv2.imread(f)  # BGR
         # Convert NumPy array to PIL image
         im = Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
+        # Convert to grayscale if enabled
+        if self.grayscale:
+            im = im.convert("L")
         sample = self.torch_transforms(im)
         return {"img": sample, "cls": j}
 
