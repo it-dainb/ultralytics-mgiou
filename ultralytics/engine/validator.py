@@ -180,6 +180,10 @@ class BaseValidator:
             else:
                 raise FileNotFoundError(emojis(f"Dataset '{self.args.data}' for task={self.args.task} not found ❌"))
 
+            # Handle grayscale mode
+            if getattr(self.args, "grayscale", False):
+                self.data["channels"] = 1
+
             if self.device.type in {"cpu", "mps"}:
                 self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
             if not (pt or (getattr(model, "dynamic", False) and not model.imx)):
